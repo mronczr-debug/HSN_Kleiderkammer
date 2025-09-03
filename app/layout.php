@@ -82,14 +82,14 @@ function layout_header(string $title = 'HSN Kleiderkammer', string $active = 'ho
       .sidebar .nav-link:hover{ background:var(--sidebar-hover-bg); color:var(--sidebar-text); }
       .sidebar .nav-link.active{ background:var(--sidebar-active-bg); color:#fff; }
 
-      /* Content-Container rechts – volle Breite, aber dezent begrenzt */
+      /* Content-Container rechts – füllt dynamisch den Platz neben der Sidebar */
       .content{
         position:relative;
         padding:20px 24px 24px 24px;
         padding-top:calc(var(--header-h) + 16px);
         margin-left:var(--sidebar-w);
         min-height:100dvh;
-        max-width:1700px;        /* Begrenzung verhindert „Endlosbreite“ der linken Karte */
+        width:calc(100vw - var(--sidebar-w)); /* nutzt die komplette Breite neben der Sidebar */
       }
 
       /* Cards / Typografie */
