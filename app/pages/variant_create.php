@@ -3,8 +3,10 @@ declare(strict_types=1);
 
 /**
  * Varianten anlegen für ein Material
- * - Verwendet INSERT ... OUTPUT INSERTED.VarianteID (SQLSRV-sicher)
- * - Integriert in globales Layout (Router rendert header/footer)
+ * - Variantenbezeichnung automatisch aus Farbe/Größe („Farbe, Größe“)
+ * - SKU automatisch aus BasisSKU/Materialname + Farbcode + Größe, mit Eindeutigkeits-Suffix -2/-3/...
+ * - Gruppe steuert zulässige Größen (vAllowed_Groessen_ByGruppe)
+ * - Erkennt sowohl Merkmal "Größe" als auch "Groesse"
  *
  * Aufruf: ?p=variant_create&material_id=...
  *
@@ -34,24 +36,45 @@ if (!$material) {
   return;
 }
 
-/* ====== Merkmal-IDs (Farbe, Größe) ====== */
-$attrStmt = $pdo->prepare("SELECT MerkmalID, MerkmalName FROM dbo.MatAttribute WHERE MerkmalName IN (N'Farbe', N'Größe')");
+/* ====== Merkmal-IDs (Farbe, Größe/Groesse) ====== */
+$attrStmt = $pdo->prepare("
+  SELECT MerkmalID, MerkmalName
+  FROM dbo.MatAttribute
+  WHERE MerkmalName IN (N'Farbe', N'Größe', N'Groesse')
+");
 $attrStmt->execute();
 $attrMap = [];
-while ($r = $attrStmt->fetch(PDO::FETCH_ASSOC)) { $attrMap[$r['MerkmalName']] = (int)$r['MerkmalID']; }
-$merkmalIdFarbe   = $attrMap['Farbe']  ?? null;
-$merkmalIdGroesse = $attrMap['Größe']  ?? null;
+$merkmalIdFarbe = null;
+$merkmalIdGroesse = null;
+while ($r = $attrStmt->fetch(PDO::FETCH_ASSOC)) {
+  $name = (string)$r['MerkmalName'];
+  if ($name === 'Farbe') {
+    $merkmalIdFarbe = (int)$r['MerkmalID'];
+  } elseif ($name === 'Größe' || $name === 'Groesse') {
+    $merkmalIdGroesse = (int)$r['MerkmalID'];
+  }
+}
 
 /* ====== Allowed Values: Farbe ====== */
 $allowedColors = [];
 if ($merkmalIdFarbe) {
-  $st = $pdo->prepare("SELECT AllowedValue FROM dbo.MatAttributeAllowedValues WHERE MerkmalID = :id ORDER BY SortOrder, AllowedValue");
+  $st = $pdo->prepare("
+    SELECT AllowedValue
+    FROM dbo.MatAttributeAllowedValues
+    WHERE MerkmalID = :id
+    ORDER BY SortOrder, AllowedValue
+  ");
   $st->execute([':id'=>$merkmalIdFarbe]);
   $allowedColors = $st->fetchAll(PDO::FETCH_COLUMN, 0);
 }
 
 /* ====== Allowed Values: Größe je Gruppe (View) ====== */
-$st = $pdo->prepare("SELECT Groesse FROM dbo.vAllowed_Groessen_ByGruppe WHERE MaterialgruppeID = :gid ORDER BY SortOrder, Groesse");
+$st = $pdo->prepare("
+  SELECT Groesse
+  FROM dbo.vAllowed_Groessen_ByGruppe
+  WHERE MaterialgruppeID = :gid
+  ORDER BY SortOrder, Groesse
+");
 $st->execute([':gid'=>$material['MaterialgruppeID']]);
 $allowedSizes = $st->fetchAll(PDO::FETCH_COLUMN, 0);
 $groupHasSizeProfile = count($allowedSizes) > 0;
@@ -62,13 +85,71 @@ $attrAll = $pdo->query("
          (SELECT STRING_AGG(av.AllowedValue, '||') WITHIN GROUP (ORDER BY av.SortOrder, av.AllowedValue)
             FROM dbo.MatAttributeAllowedValues av WHERE av.MerkmalID = a.MerkmalID) AS AllowedValuesConcat
   FROM dbo.MatAttribute a
-  WHERE a.MerkmalName NOT IN (N'Farbe', N'Größe')
+  WHERE a.MerkmalName NOT IN (N'Farbe', N'Größe', N'Groesse')
   ORDER BY a.MerkmalName
 ")->fetchAll(PDO::FETCH_ASSOC);
 
+/* ====== Helpers: Normalisierung & SKU-Generierung ====== */
+function norm_de(string $s): string {
+  $map = ['Ä'=>'AE','Ö'=>'OE','Ü'=>'UE','ä'=>'AE','ö'=>'OE','ü'=>'UE','ß'=>'SS'];
+  $s = strtr($s, $map);
+  $s = iconv('UTF-8','ASCII//TRANSLIT//IGNORE',$s);
+  $s = strtoupper($s);
+  $s = preg_replace('/[^A-Z0-9]+/', '', $s);
+  return $s ?? '';
+}
+function color_code(?string $color): string {
+  if (!$color) return '';
+  $c = trim(mb_strtolower($color));
+  $map = [
+    'schwarz'=>'BK','black'=>'BK',
+    'weiß'=>'WH','weiss'=>'WH','white'=>'WH',
+    'rot'=>'RD','red'=>'RD',
+    'blau'=>'BL','blue'=>'BL','navy'=>'NV','dunkelblau'=>'NV',
+    'grün'=>'GN','gruen'=>'GN','green'=>'GN',
+    'gelb'=>'YL','yellow'=>'YL',
+    'orange'=>'OR',
+    'grau'=>'GY','anthrazit'=>'AN','silber'=>'SV',
+    'braun'=>'BR','beige'=>'BE',
+    'violett'=>'VI','lila'=>'VI','purple'=>'PU',
+  ];
+  if (isset($map[$c])) return $map[$c];
+  $norm = norm_de($color);
+  return substr($norm, 0, 2);
+}
+function size_code(?string $size): string {
+  if (!$size) return '';
+  $s = strtoupper(trim($size));
+  $s = str_replace([' ', '/'], '', $s);
+  return preg_replace('/[^A-Z0-9\-]/', '', $s);
+}
+function sku_base(array $material): string {
+  $base = (string)($material['BasisSKU'] ?? '');
+  if ($base !== '') return norm_de($base);
+  $fromName = norm_de((string)$material['MaterialName']);
+  return substr($fromName, 0, 16);
+}
+function build_sku(array $material, ?string $color, ?string $size): string {
+  $parts = [ sku_base($material) ];
+  $cc = color_code($color);
+  if ($cc !== '') $parts[] = $cc;
+  $sc = size_code($size);
+  if ($sc !== '') $parts[] = $sc;
+  return implode('-', array_filter($parts, fn($p)=>$p !== ''));
+}
+function ensure_unique_sku(PDO $pdo, string $sku): string {
+  if ($sku === '') return '';
+  $base = $sku; $n = 1;
+  $check = $pdo->prepare("SELECT 1 FROM dbo.MatVarianten WHERE SKU = :sku");
+  while (true) {
+    $check->execute([':sku'=>$sku]);
+    if (!$check->fetchColumn()) return $sku;
+    $n++; $sku = $base.'-'.$n;
+  }
+}
+
 /* ====== Form-Values ====== */
 $values = [
-  'VarianteName' => $_POST['VarianteName'] ?? '',
   'SKU'          => $_POST['SKU'] ?? '',
   'Barcode'      => $_POST['Barcode'] ?? '',
   'IsActive'     => isset($_POST['IsActive']) ? '1' : '0',
@@ -89,24 +170,24 @@ $errors = [];
 /* ====== Handle POST ====== */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   if (!csrf_check($values['csrf'])) { $errors['csrf'] = 'Sicherheits-Token ungültig. Bitte Seite neu laden.'; }
-  if (trim($values['VarianteName']) === '') { $errors['VarianteName'] = 'Bitte Variantenbezeichnung angeben.'; }
-  if (mb_strlen($values['VarianteName']) > 200) { $errors['VarianteName'] = 'Max. 200 Zeichen.'; }
-  if ($values['SKU'] !== '' && mb_strlen($values['SKU']) > 100) { $errors['SKU'] = 'SKU max. 100 Zeichen.'; }
   if ($values['Barcode'] !== '' && mb_strlen($values['Barcode']) > 100) { $errors['Barcode'] = 'Barcode max. 100 Zeichen.'; }
 
-  // Farbe validieren (wenn Liste gepflegt)
   if ($merkmalIdFarbe && $values['Farbe'] !== '' && !in_array($values['Farbe'], $allowedColors, true)) {
     $errors['Farbe'] = 'Ungültige Farbe.';
   }
-  // Größe validieren (nur wenn Gruppe Profil hat)
+
   if ($groupHasSizeProfile) {
     if ($values['Groesse'] === '') {
       $errors['Groesse'] = 'Bitte Größe wählen.';
     } elseif (!in_array($values['Groesse'], $allowedSizes, true)) {
       $errors['Groesse'] = 'Ungültige Größe.';
     }
+  } else {
+    if ($values['Farbe'] === '' && $values['Groesse'] === '') {
+      $errors['Groesse'] = 'Bitte mindestens Farbe oder Größe angeben.';
+    }
   }
-  // Weitere Attribute validieren
+
   foreach ($attrAll as $a) {
     $mid = (int)$a['MerkmalID']; $k = 'attr_'.$mid;
     if (!array_key_exists($mid, $otherAttrValues)) continue;
@@ -123,11 +204,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
   }
 
+  // Auto-Bezeichnung
+  $parts = [];
+  if ($values['Farbe']   !== '') $parts[] = trim((string)$values['Farbe']);
+  if ($values['Groesse'] !== '') $parts[] = trim((string)$values['Groesse']);
+  $autoName = implode(', ', $parts);
+  if ($autoName === '') {
+    $errors['_'] = 'Variante kann nicht ohne Farbe/Größe benannt werden.';
+  }
+
+  // SKU bestimmen
+  $requestedSku = trim($values['SKU'] ?? '');
+  if ($requestedSku === '') {
+    $requestedSku = build_sku($material, $values['Farbe'] ?: null, $values['Groesse'] ?: null);
+  }
+  if ($requestedSku !== '' && mb_strlen($requestedSku) > 100) {
+    $errors['SKU'] = 'SKU max. 100 Zeichen.';
+  }
+  $finalSku = null;
+  if ($requestedSku !== '') {
+    $finalSku = ensure_unique_sku($pdo, $requestedSku);
+  }
+
   if (!$errors) {
     try {
       $pdo->beginTransaction();
 
-      // SQLSRV-stabil: OUTPUT INSERTED.VarianteID
+      // Variante
       $sqlVar = "
         INSERT INTO dbo.MatVarianten (MaterialID, VariantenBezeichnung, SKU, Barcode, IsActive, CreatedAt)
         OUTPUT INSERTED.VarianteID
@@ -136,23 +239,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $stIns = $pdo->prepare($sqlVar);
       $stIns->execute([
         ':mid'     => $materialId,
-        ':name'    => $values['VarianteName'],
-        ':sku'     => ($values['SKU'] === '' ? null : $values['SKU']),
+        ':name'    => $autoName,
+        ':sku'     => $finalSku,
         ':barcode' => ($values['Barcode'] === '' ? null : $values['Barcode']),
         ':act'     => ($values['IsActive'] === '1' ? 1 : 0),
       ]);
       $varianteId = (int)$stIns->fetchColumn();
 
-      // Attribute schreiben
+      // Attribute Farbe/Größe + weitere
       $insAttr = $pdo->prepare("
         INSERT INTO dbo.MatVariantenAttribute (VarianteID, MerkmalID, MerkmalWert)
         VALUES (:vid, :mid, :val)
       ");
-
       if ($merkmalIdFarbe && $values['Farbe'] !== '') {
         $insAttr->execute([':vid'=>$varianteId, ':mid'=>$merkmalIdFarbe,  ':val'=>$values['Farbe']]);
       }
-      if ($merkmalIdGroesse && $groupHasSizeProfile && $values['Groesse'] !== '') {
+      if ($merkmalIdGroesse && $values['Groesse'] !== '') {
         $insAttr->execute([':vid'=>$varianteId, ':mid'=>$merkmalIdGroesse, ':val'=>$values['Groesse']]);
       }
       foreach ($otherAttrValues as $mid => $val) {
@@ -161,13 +263,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       }
 
       $pdo->commit();
-      $_SESSION['flash_success'] = 'Variante wurde angelegt.';
+      $_SESSION['flash_success'] = 'Variante „'.$autoName.'“ wurde angelegt.'.($finalSku ? ' SKU: '.$finalSku : '');
       header('Location: '.$base.'/?p=variant_create&material_id='.$materialId);
       exit;
 
     } catch (Throwable $e) {
       if ($pdo->inTransaction()) $pdo->rollBack();
-      $errors['_'] = 'Speichern fehlgeschlagen: '.$e->getMessage();
+      $msg = $e->getMessage();
+      if (stripos($msg, 'UQ_Variante_Material_Bez') !== false) {
+        $errors['_'] = 'Es existiert bereits eine Variante mit der Bezeichnung „'.$autoName.'“ für dieses Material.';
+      } elseif (stripos($msg, 'UQ_Variante_SKU') !== false || stripos($msg, 'UX_MatVarianten_SKU_NotNull') !== false) {
+        $errors['_'] = 'Die angegebene/erzeugte SKU ist bereits vergeben.';
+      } else {
+        $errors['_'] = 'Speichern fehlgeschlagen: '.$msg;
+      }
     }
   }
 }
@@ -176,7 +285,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $existing = $pdo->prepare("
   SELECT v.VarianteID, v.VariantenBezeichnung, v.SKU, v.Barcode, v.IsActive,
          MAX(CASE WHEN a.MerkmalName = N'Farbe' THEN va.MerkmalWert END) AS Farbe,
-         MAX(CASE WHEN a.MerkmalName = N'Größe' THEN va.MerkmalWert END) AS Groesse
+         MAX(CASE WHEN a.MerkmalName IN (N'Größe', N'Groesse') THEN va.MerkmalWert END) AS Groesse
   FROM dbo.MatVarianten v
   LEFT JOIN dbo.MatVariantenAttribute va ON va.VarianteID = v.VarianteID
   LEFT JOIN dbo.MatAttribute a ON a.MerkmalID = va.MerkmalID
@@ -205,33 +314,27 @@ $flashSuccess = $_SESSION['flash_success'] ?? null; unset($_SESSION['flash_succe
       <div class="alert alert-error"><?= e($errors['_']) ?></div>
     <?php endif; ?>
 
-    <form method="post" action="">
+    <form method="post" action="" id="variantForm">
       <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
 
-      <div class="row">
+      <div class="row-1">
         <div>
-          <label for="VarianteName">Variantenbezeichnung *</label>
-          <input type="text" id="VarianteName" name="VarianteName" maxlength="200" required value="<?= e($values['VarianteName']) ?>">
-          <?php if (!empty($errors['VarianteName'])): ?><div class="alert alert-error"><?= e($errors['VarianteName']) ?></div><?php endif; ?>
-          <div class="hint">z. B. „Schwarz, 52“ oder „Rot, XL“</div>
-        </div>
-        <div>
-          <label for="SKU">SKU / Artikelnummer</label>
-          <input type="text" id="SKU" name="SKU" maxlength="100" value="<?= e($values['SKU']) ?>">
-          <?php if (!empty($errors['SKU'])): ?><div class="alert alert-error"><?= e($errors['SKU']) ?></div><?php endif; ?>
+          <label>Variantenname (automatisch)</label>
+          <div id="autoNamePreview" class="hint" style="font-weight:600;">—</div>
         </div>
       </div>
 
       <div class="row">
         <div>
+          <label for="SKU">SKU / Artikelnummer (automatisch, anpassbar)</label>
+          <input type="text" id="SKU" name="SKU" maxlength="100" value="<?= e($values['SKU']) ?>">
+          <?php if (!empty($errors['SKU'])): ?><div class="alert alert-error"><?= e($errors['SKU']) ?></div><?php endif; ?>
+          <div class="hint">Wird automatisch vorgeschlagen, kann aber überschrieben werden.</div>
+        </div>
+        <div>
           <label for="Barcode">Barcode</label>
           <input type="text" id="Barcode" name="Barcode" maxlength="100" value="<?= e($values['Barcode']) ?>">
           <?php if (!empty($errors['Barcode'])): ?><div class="alert alert-error"><?= e($errors['Barcode']) ?></div><?php endif; ?>
-        </div>
-        <div style="display:flex;align-items:flex-end">
-          <label style="display:flex;gap:.5rem;align-items:center;margin:0">
-            <input type="checkbox" name="IsActive" value="1" <?= ($values['IsActive']==='1'?'checked':'') ?>> Aktiv
-          </label>
         </div>
       </div>
 
@@ -257,14 +360,22 @@ $flashSuccess = $_SESSION['flash_success'] ?? null; unset($_SESSION['flash_succe
               <?php endforeach; ?>
             </select>
           <?php else: ?>
-            <input type="text" id="Groesse" name="Groesse" value="<?= e($values['Groesse']) ?>" placeholder="(optional)">
+            <input type="text" id="Groesse" name="Groesse" value="<?= e($values['Groesse']) ?>" placeholder="(optional, wenn kein Profil)">
           <?php endif; ?>
           <?php if (!empty($errors['Groesse'])): ?><div class="alert alert-error"><?= e($errors['Groesse']) ?></div><?php endif; ?>
-          <div class="hint">Größen kommen aus dem Profil der Gruppe „<?= e($material['Gruppenname']) ?>“.</div>
+          <div class="hint">
+            Größen kommen aus dem Profil der Gruppe „<?= e($material['Gruppenname']) ?>“.
+          </div>
         </div>
       </div>
 
       <?php if (!empty($attrAll)): ?>
+        <div class="row-1">
+          <div>
+            <label>Weitere Merkmale</label>
+            <div class="hint">Optional. Falls „Allowed Values“ gepflegt sind, werden Auswahllisten angezeigt.</div>
+          </div>
+        </div>
         <div class="row-3">
           <?php foreach ($attrAll as $a):
             $mid = (int)$a['MerkmalID']; $k='attr_'.$mid; $val = $otherAttrValues[$mid] ?? '';
@@ -288,7 +399,11 @@ $flashSuccess = $_SESSION['flash_success'] ?? null; unset($_SESSION['flash_succe
         </div>
       <?php endif; ?>
 
-      <div style="display:flex;gap:8px;align-items:center;margin-top:.5rem">
+      <div style="display:flex;align-items:center;gap:16px;margin-top:.5rem">
+        <label style="display:flex;gap:.5rem;align-items:center;margin:0">
+          <input type="checkbox" name="IsActive" value="1" <?= ($values['IsActive']==='1'?'checked':'') ?>> Aktiv
+        </label>
+
         <button class="btn btn-primary" type="submit">Variante speichern</button>
         <a class="btn btn-secondary" href="<?= e($base) ?>/?p=materials">Zur Materialliste</a>
       </div>
@@ -321,16 +436,92 @@ $flashSuccess = $_SESSION['flash_success'] ?? null; unset($_SESSION['flash_succe
     <?php endif; ?>
   </div>
 
-  <!-- Rechte Info/Tipps -->
   <div class="card">
     <h2>Hinweise</h2>
     <ul class="muted" style="margin-left:1rem">
-      <li>Farbe/Größe sind Attribute; weitere Merkmale kannst du frei pflegen.</li>
+      <li>Variantenname wird automatisch aus Farbe &amp; Größe gebildet.</li>
+      <li>SKU wird automatisch vorgeschlagen (BasisSKU/Material + Farbcode + Größe) und auf Eindeutigkeit geprüft.</li>
       <li>Größenprofil kommt aus der Materialgruppe „<?= e($material['Gruppenname']) ?>“.</li>
-      <li>Du kannst später Attribute ergänzen/ändern; die Liste unten zeigt vorhandene Varianten.</li>
+      <li>Bei Gruppen ohne Größenprofil: Mindestens Farbe oder Größe angeben.</li>
     </ul>
     <div style="margin-top:1rem">
       <a class="btn btn-secondary" href="<?= e($base) ?>/?p=materials">Zur Materialliste</a>
     </div>
   </div>
 </div>
+
+<script>
+  (function(){
+    const basisSKU = "<?= e((string)($material['BasisSKU'] ?? '')) ?>";
+    const materialName = "<?= e((string)$material['MaterialName']) ?>";
+
+    function normDe(str){
+      if(!str) return '';
+      const map = {'Ä':'AE','Ö':'OE','Ü':'UE','ä':'AE','ö':'OE','ü':'UE','ß':'SS'};
+      str = str.replace(/[ÄÖÜäöüß]/g, ch => map[ch] || ch);
+      str = str.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+      str = str.toUpperCase().replace(/[^A-Z0-9]+/g,'');
+      return str;
+    }
+    function colorCode(c){
+      if(!c) return '';
+      const m = {
+        'schwarz':'BK','black':'BK',
+        'weiß':'WH','weiss':'WH','white':'WH',
+        'rot':'RD','red':'RD',
+        'blau':'BL','blue':'BL','navy':'NV','dunkelblau':'NV',
+        'grün':'GN','gruen':'GN','green':'GN',
+        'gelb':'YL','yellow':'YL',
+        'orange':'OR',
+        'grau':'GY','anthrazit':'AN','silber':'SV',
+        'braun':'BR','beige':'BE',
+        'violett':'VI','lila':'VI','purple':'PU'
+      };
+      const key = String(c).trim().toLowerCase();
+      if(m[key]) return m[key];
+      const n = normDe(c);
+      return n.substring(0,2);
+    }
+    function sizeCode(s){
+      if(!s) return '';
+      s = String(s).toUpperCase().trim().replace(/[ \/]/g,'');
+      return s.replace(/[^A-Z0-9\-]/g,'');
+    }
+    function skuBase(){
+      if(basisSKU) return normDe(basisSKU);
+      return normDe(materialName).substring(0,16);
+    }
+    function buildSku(color, size){
+      const parts = [skuBase()];
+      const cc = colorCode(color);
+      if(cc) parts.push(cc);
+      const sc = sizeCode(size);
+      if(sc) parts.push(sc);
+      return parts.join('-');
+    }
+
+    const f = document.getElementById('Farbe');
+    const g = document.getElementById('Groesse');
+    const outName = document.getElementById('autoNamePreview');
+    const skuInput = document.getElementById('SKU');
+
+    function updatePreview(){
+      const color = f ? (f.value || '').trim() : '';
+      const gsel = g ? (g.tagName === 'SELECT' ? (g.options[g.selectedIndex]?.text || '') : g.value) : '';
+      const size = (gsel || '').trim();
+
+      const parts = [];
+      if(color) parts.push(f.options ? f.options[f.selectedIndex].text : color);
+      if(size)  parts.push(size);
+      outName.textContent = parts.length ? parts.join(', ') : '—';
+
+      if(skuInput && skuInput.value.trim() === '') {
+        skuInput.placeholder = buildSku(color, size);
+      }
+    }
+
+    if (f) f.addEventListener('change', updatePreview);
+    if (g) g.addEventListener('change', updatePreview);
+    updatePreview();
+  })();
+</script>

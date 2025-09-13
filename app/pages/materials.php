@@ -3,8 +3,8 @@ declare(strict_types=1);
 
 /**
  * Materialien – Übersicht & Anlage
- * - Verwendet INSERT ... OUTPUT INSERTED.MaterialID (SQLSRV-sicher)
- * - Integriert in globales Layout (Router rendert header/footer)
+ * - Nach Anlage direkter Sprung zur Variantenanlage (material_id)
+ * - INSERT ... OUTPUT INSERTED.MaterialID (SQLSRV-sicher)
  *
  * Erwartet: $pdo (PDO SQLSRV), Helpers e(), csrf_token(), csrf_check(), base_url()
  */
@@ -39,7 +39,7 @@ if (($_POST['action'] ?? '') === 'create') {
     try {
       $pdo->beginTransaction();
 
-      // SQLSRV-stabil: OUTPUT INSERTED.MaterialID statt SCOPE_IDENTITY()
+      // SQLSRV-stabil: OUTPUT INSERTED.MaterialID
       $stmt = $pdo->prepare("
         INSERT INTO dbo.Material
           (MaterialName, Beschreibung, HerstellerID, MaterialgruppeID, BasisSKU, IsActive, CreatedAt)
@@ -58,9 +58,12 @@ if (($_POST['action'] ?? '') === 'create') {
       $newId = (int)$stmt->fetchColumn();
 
       $pdo->commit();
-      $_SESSION['flash_success'] = 'Material wurde angelegt.';
-      header('Location: '.$base.'/?p=materials#row-'.$newId);
+
+      // Direkt in die Varianten-Anlage springen
+      $_SESSION['flash_success'] = 'Material wurde angelegt. Lege jetzt Varianten an.';
+      header('Location: '.$base.'/?p=variant_create&material_id='.$newId);
       exit;
+
     } catch (Throwable $e) {
       if ($pdo->inTransaction()) $pdo->rollBack();
       $createErrors['_'] = 'Speichern fehlgeschlagen: '.$e->getMessage();
@@ -104,9 +107,7 @@ $stmtCnt = $pdo->prepare("
   LEFT JOIN dbo.Hersteller h ON h.HerstellerID = m.HerstellerID
   $whereSql
 ");
-foreach ($params as $k=>$v) {
-  $stmtCnt->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
-}
+foreach ($params as $k=>$v) $stmtCnt->bindValue($k, $v, is_int($v)?PDO::PARAM_INT:PDO::PARAM_STR);
 $stmtCnt->execute();
 $total = (int)$stmtCnt->fetch(PDO::FETCH_ASSOC)['cnt'];
 $pages = max(1, (int)ceil($total / $pageSize));
@@ -129,9 +130,7 @@ $sqlRows = "
   OFFSET :off ROWS FETCH NEXT :ps ROWS ONLY;
 ";
 $stmt = $pdo->prepare($sqlRows);
-foreach ($params as $k=>$v) {
-  $stmt->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
-}
+foreach ($params as $k=>$v) $stmt->bindValue($k, $v, is_int($v)?PDO::PARAM_INT:PDO::PARAM_STR);
 $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
 $stmt->bindValue(':ps',  $pageSize, PDO::PARAM_INT);
 $stmt->execute();
@@ -139,7 +138,6 @@ $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 /* ========= UI ========= */
 $flashSuccess = $_SESSION['flash_success'] ?? null; unset($_SESSION['flash_success']);
-
 $qs = function(array $overrides=[]) use($q,$grp,$man,$active){
   return http_build_query(array_merge(['p'=>'materials','q'=>$q,'grp'=>$grp,'man'=>$man,'active'=>$active], $overrides));
 };
@@ -229,7 +227,6 @@ $qs = function(array $overrides=[]) use($q,$grp,$man,$active){
               <td><?= (int)$r['VariantenCount'] ?></td>
               <td><?= ((int)$r['IsActive']===1 ? '<span class="pill on">aktiv</span>' : '<span class="pill off">inaktiv</span>') ?></td>
               <td>
-                <!-- Falls du die Variants-Seite über den Router nutzt, füge in /public/index.php 'variant_create' zur Whitelist hinzu -->
                 <a class="btn btn-secondary" href="<?= e($base) ?>/?p=variant_create&material_id=<?= (int)$r['MaterialID'] ?>">Varianten</a>
               </td>
             </tr>
@@ -294,7 +291,7 @@ $qs = function(array $overrides=[]) use($q,$grp,$man,$active){
             <?php endforeach; ?>
           </select>
           <?php if (!empty($createErrors['MaterialgruppeID'])): ?><div class="alert alert-error"><?= e($createErrors['MaterialgruppeID']) ?></div><?php endif; ?>
-          <div class="hint">Die Gruppe steuert das Größenprofil (z. B. „… (DE)“ = 42–64).</div>
+          <div class="hint">Die Gruppe steuert das Größenprofil (z. B. S–XXXL oder 36–48).</div>
         </div>
       </div>
 
@@ -314,13 +311,13 @@ $qs = function(array $overrides=[]) use($q,$grp,$man,$active){
       <?php endif; ?>
 
       <div style="display:flex;gap:8px;align-items:center">
-        <button class="btn btn-primary" type="submit">Anlegen</button>
+        <button class="btn btn-primary" type="submit">Anlegen & Varianten</button>
         <a class="btn btn-secondary" href="<?= e($base) ?>/?p=materials">Zurücksetzen</a>
       </div>
     </form>
 
     <div class="hint" style="margin-top:.6rem">
-      Nach dem Anlegen kannst du über <em>„Varianten“</em> die Farbe/Größe & weitere Merkmale pflegen.
+      Nach dem Anlegen springst du automatisch in die Variantenpflege.
     </div>
   </div>
 </div>
