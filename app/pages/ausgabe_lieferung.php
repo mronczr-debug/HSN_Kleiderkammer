@@ -55,17 +55,12 @@ $k->execute([':id'=>$bestellungId]);
 $kopf = $k->fetch(PDO::FETCH_ASSOC);
 if (!$kopf) { http_response_code(404); exit('Bestellung nicht gefunden.'); }
 
-if ((int)$kopf['Status'] !== 0) {
-  // Bereits abgeschlossen -> Anzeige nur
-}
-
 /* ========= Lieferung kopf ggf. anlegen (1:1) ========= */
 $lstmt = $pdo->prepare("SELECT * FROM dbo.MitarbeiterLieferungKopf WHERE BestellungID = :id");
 $lstmt->execute([':id'=>$bestellungId]);
 $liefer = $lstmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$liefer) {
-  // neu anlegen
   try {
     $pdo->beginTransaction();
 
@@ -89,7 +84,6 @@ if (!$liefer) {
     ]);
     $lieferId = (int)$ins->fetchColumn();
 
-    // Positionen aus Bestellung kopieren
     $pdo->prepare("
       INSERT INTO dbo.MitarbeiterLieferungPos (LieferungID, PosNr, VarianteID, Menge)
       SELECT :lid, p.PosNr, p.VarianteID, p.Menge
@@ -120,7 +114,7 @@ $pos = $pdo->prepare("
 $pos->execute([':lid'=>$liefer['LieferungID']]);
 $posRows = $pos->fetchAll(PDO::FETCH_ASSOC);
 
-/* ========= Kaskaden-Daten (für Edit) ========= */
+/* ========= Kaskaden-Daten ========= */
 $gruppen = $pdo->query("SELECT MaterialgruppeID AS id, Gruppenname AS name FROM dbo.Materialgruppe ORDER BY Gruppenname")->fetchAll(PDO::FETCH_ASSOC);
 $materialRaw = $pdo->query("
   SELECT m.MaterialID AS id, m.MaterialName AS name, m.MaterialgruppeID AS gid, m.HerstellerID AS hid
@@ -140,7 +134,7 @@ $variantenRaw = $pdo->query("
   ORDER BY v.VariantenBezeichnung
 ")->fetchAll(PDO::FETCH_ASSOC);
 
-/* Für Rückgabe: offene Varianten dieses Mitarbeiters (harte Begrenzung) */
+/* Rückgabe: harte Begrenzung */
 $offenByEmp = [];
 if ($kopf['Typ']==='R') {
   $st = $pdo->prepare("
@@ -152,8 +146,7 @@ if ($kopf['Typ']==='R') {
     WHERE avo.MitarbeiterID = :mid
   ");
   $st->execute([':mid'=>$kopf['MitarbeiterID']]);
-  $off = $st->fetchAll(PDO::FETCH_ASSOC);
-  foreach ($off as $x) {
+  foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $x) {
     $offenByEmp[(int)$x['VarianteID']] = [
       'offen'=>(float)$x['Offen'], 'mid'=>(int)$x['MaterialID'],
       'gid'=>(int)$x['gid'], 'hid'=>(int)$x['hid']
@@ -161,7 +154,7 @@ if ($kopf['Typ']==='R') {
   }
 }
 
-/* ========= POST: Positionen ändern, Lieferung löschen, Buchen ========= */
+/* ========= Aktionen: Positionen, Verwerfen, Buchen ========= */
 $errors = [];
 if (($_POST['action'] ?? '') === 'save_lines') {
   if (!csrf_check($_POST['csrf'] ?? '')) $errors['_']='Sicherheits-Token ungültig.';
@@ -174,11 +167,7 @@ if (($_POST['action'] ?? '') === 'save_lines') {
     if ($gid<=0 || $hid<=0 || $mid<=0 || $vid<=0) { $errors["pos_$i"]='Bitte Kategorie/Hersteller/Artikel/Variante wählen.'; continue; }
     if ($qty==='' || !is_numeric($qty) || (float)$qty<=0) { $errors["pos_$i"]=($errors["pos_$i"]??'').' Menge > 0 erforderlich.'; continue; }
     if ($kopf['Typ']==='R') {
-      // Clientseitig gefiltert; serverseitig prüfen (gegen offene Mengen)
-      $stmt = $pdo->prepare("
-        SELECT avo.Offen FROM dbo.v_Mitarbeiter_AusgabeOffen avo
-        WHERE avo.MitarbeiterID = :mid AND avo.VarianteID = :vid
-      ");
+      $stmt = $pdo->prepare("SELECT avo.Offen FROM dbo.v_Mitarbeiter_AusgabeOffen avo WHERE avo.MitarbeiterID=:mid AND avo.VarianteID=:vid");
       $stmt->execute([':mid'=>$kopf['MitarbeiterID'], ':vid'=>$vid]);
       $r = $stmt->fetch(PDO::FETCH_ASSOC);
       if (!$r || (float)$qty > (float)$r['Offen']) { $errors["pos_$i"]='Rückgabemenge überschreitet offene Menge.'; continue; }
@@ -216,23 +205,33 @@ if (($_POST['action'] ?? '') === 'book') {
   if (!csrf_check($_POST['csrf'] ?? '')) { $errors['_']='Sicherheits-Token ungültig.'; }
   if (!$errors) {
     try {
+      // 1) DB-Buchen
       if ($kopf['Typ']==='A') {
         $stmt = $pdo->prepare("EXEC dbo.sp_Ausgabe_Buchen @LieferungID = :id");
       } else {
         $stmt = $pdo->prepare("EXEC dbo.sp_Rueckgabe_Buchen @LieferungID = :id");
       }
       $stmt->execute([':id'=>$liefer['LieferungID']]);
-      flash('success', ($kopf['Typ']==='A'?'Ausgabe':'Rückgabe').' gebucht. LieferNr: '.$liefer['LieferNr']);
+
+      // 2) PDF erzeugen
+      require_once __DIR__.'/../pdf/make_delivery_pdf.php';
+      // Dompdf Autoloader (composer)
+      $autoload = realpath(__DIR__.'/../../vendor/autoload.php');
+      if ($autoload) require_once $autoload;
+
+      $webPath = pdf_make_delivery($pdo, (int)$liefer['LieferungID'], windows_user());
+
+      flash('success', ($kopf['Typ']==='A'?'Ausgabe':'Rückgabe')." gebucht. PDF: <a class=\"btn btn-secondary\" target=\"_blank\" href=\"".e($webPath)."\">Beleg öffnen</a>");
       header('Location: ?p=ausgabe'); exit;
     } catch (Throwable $e) {
-      $errors['_'] = 'Buchen fehlgeschlagen: '.$e->getMessage();
+      $errors['_'] = 'Buchen oder PDF-Erzeugung fehlgeschlagen: '.$e->getMessage();
     }
   }
 }
 
 /* ========= UI ========= */
-$title = ($kopf['Typ']==='A'?'Lieferung (Ausgabe)':'Rückgabe (Lieferung)');
 require __DIR__.'/../layout.php';
+$title = ($kopf['Typ']==='A'?'Lieferung (Ausgabe)':'Rückgabe (Lieferung)');
 layout_header($title);
 ?>
   <div class="card">
@@ -293,25 +292,26 @@ layout_header($title);
           <button class="btn btn-secondary" type="submit" name="action" value="discard">Verwerfen</button>
         <?php else: ?>
           <span class="btn btn-secondary" style="opacity:.6;pointer-events:none">Änderungen nicht möglich</span>
+          <?php if (!empty($liefer['PdfPath'])): ?>
+            <a class="btn btn-secondary" target="_blank" href="<?= e($liefer['PdfPath']) ?>">PDF Ausgabebeleg</a>
+          <?php endif; ?>
         <?php endif; ?>
       </div>
     </form>
 
     <div style="margin-top:10px;display:flex;gap:8px">
       <?php if ((int)$liefer['Status']===0): ?>
-        <form method="post" onsubmit="return confirm('Jetzt buchen?');">
+        <form method="post" onsubmit="return confirm('Jetzt buchen und PDF erzeugen?');">
           <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
           <input type="hidden" name="action" value="book">
-          <button class="btn btn-primary" type="submit"><?= $kopf['Typ']==='A'?'Ausgabe buchen':'Rückgabe buchen' ?></button>
+          <button class="btn btn-primary" type="submit"><?= $kopf['Typ']==='A'?'Ausgabe buchen + PDF':'Rückgabe buchen + PDF' ?></button>
         </form>
         <button class="btn btn-secondary" type="button" title="Noch ohne Funktion">Unterschrift erfassen</button>
       <?php else: ?>
         <span class="btn btn-secondary" style="opacity:.6;pointer-events:none">Bereits gebucht</span>
-      <?php endif; ?>
-      <?php if (!empty($liefer['PdfPath'])): ?>
-        <a class="btn btn-secondary" target="_blank" href="<?= e($liefer['PdfPath']) ?>">PDF Ausgabebeleg</a>
-      <?php else: ?>
-        <span class="btn btn-secondary" style="opacity:.6;pointer-events:none">PDF Ausgabebeleg</span>
+        <?php if (!empty($liefer['PdfPath'])): ?>
+          <a class="btn btn-secondary" target="_blank" href="<?= e($liefer['PdfPath']) ?>">PDF Ausgabebeleg</a>
+        <?php endif; ?>
       <?php endif; ?>
       <a class="btn btn-secondary" href="?p=ausgabe">Zurück</a>
     </div>
@@ -371,7 +371,7 @@ layout_header($title);
 
     function renumber(){
       [...tbody.querySelectorAll('tr')].forEach((tr, i)=>{
-        tr.querySelector('.pos-cell').textContent = (i+1);
+        tr.querySelector('.pos-cell')?.textContent = (i+1);
         tr.querySelectorAll('select, input').forEach(inp=>{
           const name = inp.getAttribute('name'); if (!name) return;
           const newName = name.replace(/pos\[\d+\]/, 'pos['+(i)+']');
@@ -395,19 +395,19 @@ layout_header($title);
         selV = buildSelect([], '— bitte wählen —', pref?.VarianteID || '');
         tdG.appendChild(selG); tdH.appendChild(selH); tdM.appendChild(selM); tdV.appendChild(selV);
         function onG(){
-          selH = replaceSel(selH, mansF.filter(h=>String(h.gid)===String(selG.value)), pref?.hid || '', `pos[${idx}][hid]`);
-          selH.addEventListener('change', onH); onH();
+          replaceSel(selH, mansF.filter(h=>String(h.gid)===String(selG.value)), pref?.hid || '', `pos[${idx}][hid]`, (n)=> selH=n );
+          onH();
         }
         function onH(){
-          selM = replaceSel(selM, matsF.filter(m=>String(m.gid)===String(selG.value) && String(m.hid)===String(selH.value)), pref?.MaterialID || '', `pos[${idx}][mid]`);
-          selM.addEventListener('change', onM); onM();
+          replaceSel(selM, matsF.filter(m=>String(m.gid)===String(selG.value) && String(m.hid)===String(selH.value)), pref?.MaterialID || '', `pos[${idx}][mid]`, (n)=> selM=n );
+          onM();
         }
         function onM(){
           const opts = fVars.filter(v=>String(v.mid)===String(selM.value)).map(v=>{
             const off = offenMap[Number(v.id)]?.offen ?? null;
             return {id:v.id, name: v.name + (off!=null?` (offen: ${off})`:``)};
           });
-          selV = replaceSel(selV, opts, pref?.VarianteID || '', `pos[${idx}][vid]`);
+          replaceSel(selV, opts, pref?.VarianteID || '', `pos[${idx}][vid]`, (n)=> selV=n );
         }
         selG.name = `pos[${idx}][gid]`; selG.required=true; selG.addEventListener('change', onG); onG();
       } else {
@@ -416,41 +416,25 @@ layout_header($title);
         selM = buildSelect([], '— bitte wählen —', pref?.MaterialID || '');
         selV = buildSelect([], '— bitte wählen —', pref?.VarianteID || '');
         tdG.appendChild(selG); tdH.appendChild(selH); tdM.appendChild(selM); tdV.appendChild(selV);
-        function onG(){
-          selH = replaceSel(selH, herstellerByGroup(selG.value), pref?.hid || '', `pos[${idx}][hid]`);
-          selH.addEventListener('change', onH); onH();
-        }
-        function onH(){
-          selM = replaceSel(selM, materialsByGH(selG.value, selH.value), pref?.MaterialID || '', `pos[${idx}][mid]`);
-          selM.addEventListener('change', onM); onM();
-        }
-        function onM(){
-          selV = replaceSel(selV, variantsByMaterial(selM.value), pref?.VarianteID || '', `pos[${idx}][vid]`);
-        }
+        function onG(){ replaceSel(selH, herstellerByGroup(selG.value), pref?.hid || '', `pos[${idx}][hid]`, (n)=> selH=n ); onH(); }
+        function onH(){ replaceSel(selM, materialsByGH(selG.value, selH.value), pref?.MaterialID || '', `pos[${idx}][mid]`, (n)=> selM=n ); onM(); }
+        function onM(){ replaceSel(selV, variantsByMaterial(selM.value), pref?.VarianteID || '', `pos[${idx}][vid]`, (n)=> selV=n ); }
         selG.name = `pos[${idx}][gid]`; selG.required=true; selG.addEventListener('change', onG); onG();
       }
 
-      inpQ = el('input', {type:'number', step:'0.001', min:'0.001', name:`pos[${idx}][qty]`, value:(pref?.Menge || '')}, []);
-      if (!editable) inpQ.setAttribute('disabled','true');
+      inpQ = el('input', {type:'number', step:'0.001', min:'0.001', name:`pos[${idx}][qty]`, value:(pref?.Menge || ''), ...(editable?{}:{disabled:true})});
       tdQ.appendChild(inpQ);
 
       tr.appendChild(tdPos); tr.appendChild(tdG); tr.appendChild(tdH); tr.appendChild(tdM); tr.appendChild(tdV); tr.appendChild(tdQ);
       tbody.appendChild(tr); renumber();
     }
 
-    function replaceSel(sel, options, value, name){
+    function replaceSel(sel, options, value, name, cb){
       const n = buildSelect(options, '— bitte wählen —', value);
-      sel.replaceWith(n); n.name = name; n.required=true; return n;
+      sel.replaceWith(n); n.name = name; n.required=true; cb(n);
     }
 
-    // initial Rows
-    if (posted && posted.length) {
-      posted.forEach(r=> addRow(r));
-    } else {
-      addRow();
-    }
-
-    const addBtn = document.getElementById('addRowBtn');
+    if (posted && posted.length) posted.forEach(r=> addRow(r)); else addRow();
     if (addBtn) addBtn.addEventListener('click', ()=>addRow());
   })();
   </script>
