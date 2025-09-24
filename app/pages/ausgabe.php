@@ -1,7 +1,10 @@
 <?php
 // app/pages/ausgabe.php
 declare(strict_types=1);
-session_start();
+//session_start();
+if (session_status() !== PHP_SESSION_ACTIVE) {
+  session_start();
+}
 
 /* ========= Minimal-Helpers (keine Redeklaration) ========= */
 if (!function_exists('e')) { function e(?string $s): string { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); } }

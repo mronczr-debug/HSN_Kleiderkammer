@@ -1,618 +1,637 @@
 <?php
-// app/pages/ausgabe_bestellung_neu.php
 declare(strict_types=1);
-session_start();
 
-/* ========= Minimal-Helpers ========= */
-if (!function_exists('e')) { function e(?string $s): string { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); } }
-if (!function_exists('csrf_token')) { function csrf_token(): string { if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(16)); return $_SESSION['csrf']; } }
-if (!function_exists('csrf_check')) { function csrf_check(string $t): bool { return hash_equals($_SESSION['csrf'] ?? '', $t); } }
-if (!function_exists('flash')) {
-  function flash(string $key, ?string $msg=null): ?string {
-    if ($msg !== null) { $_SESSION['flash_'.$key] = $msg; return null; }
-    $val = $_SESSION['flash_'.$key] ?? null; unset($_SESSION['flash_'.$key]); return $val;
-  }
-}
-if (!function_exists('windows_user')) {
-  function windows_user(): string {
-    $candidates = [
-      $_SERVER['AUTH_USER']   ?? null,
-      $_SERVER['REMOTE_USER'] ?? null,
-      $_SERVER['LOGON_USER']  ?? null,
-      $_SERVER['USERNAME']    ?? null,
-    ];
-    foreach ($candidates as $u) { $u = trim((string)$u); if ($u!=='') return mb_substr($u,0,256); }
-    return 'unknown';
-  }
+// Session sicher starten
+if (session_status() !== PHP_SESSION_ACTIVE) {
+  session_start();
 }
 
-/* ========= DB Connect ========= */
-$dsn  = 'sqlsrv:Server=NAUSWIASPSQL01;Database=Arbeitskleidung';
-$user = 'HSN_DB1';
-$pass = 'HSNdb1';
-try {
-  $pdo = new PDO($dsn, $user, $pass, [
-    PDO::ATTR_ERRMODE         => PDO::ERRMODE_EXCEPTION,
-    PDO::SQLSRV_ATTR_ENCODING => PDO::SQLSRV_ENCODING_UTF8
-  ]);
-} catch (Throwable $e) { http_response_code(500); exit('DB-Verbindung fehlgeschlagen: '.e($e->getMessage())); }
+// Includes
+require_once __DIR__ . '/../../lib/helpers.php';
+require_once __DIR__ . '/../../config/db.php'; // stellt $pdo (PDO) bereit
 
-/* ========= AJAX: Mitarbeiter-Suche ========= */
-if (($_GET['action'] ?? '') === 'employee_search') {
+if (!isset($pdo) || !($pdo instanceof PDO)) {
+  http_response_code(500);
+  exit('DB-Verbindung nicht verfügbar.');
+}
+
+/* ============================================================
+   Hilfsfunktionen
+   ============================================================ */
+
+function csrf_token_local(): string {
+  if (empty($_SESSION['csrf'])) {
+    $_SESSION['csrf'] = bin2hex(random_bytes(16));
+  }
+  return $_SESSION['csrf'];
+}
+function csrf_check_local(string $t): bool {
+  return hash_equals($_SESSION['csrf'] ?? '', $t);
+}
+function current_login(): ?string {
+  foreach (['REMOTE_USER','AUTH_USER','LOGON_USER'] as $k) {
+    if (!empty($_SERVER[$k])) return (string)$_SERVER[$k];
+  }
+  $u = getenv('USERNAME');
+  return $u ?: null;
+}
+
+/* ============================================================
+   AJAX: Mitarbeitersuche
+   GET ?p=ausgabe_bestellung_neu&ajax=1&action=search_emp&q=...&onlyActive=1
+   ============================================================ */
+if (isset($_GET['ajax']) && $_GET['ajax'] === '1' && ($_GET['action'] ?? '') === 'search_emp') {
   header('Content-Type: application/json; charset=utf-8');
-  $term = trim((string)($_GET['term'] ?? ''));
-  if ($term === '') { echo json_encode([]); exit; }
-  $stmt = $pdo->prepare("
-    SELECT TOP (20)
-      ms.MitarbeiterID AS id,
-      ms.Personalnummer AS pn,
-      ms.Nachname, ms.Vorname,
-      ms.Abteilung,
-      mt.Bezeichnung AS Typ,
-      mk.Bezeichnung AS Kategorie
-    FROM dbo.MitarbeiterStamm ms
-    JOIN dbo.MitarbeiterTyp mt ON mt.TypID = ms.MitarbeiterTypID
-    JOIN dbo.MitarbeiterKategorie mk ON mk.KategorieID = ms.MitarbeiterKategorieID
-    WHERE ms.Personalnummer LIKE :t OR ms.Nachname LIKE :t OR ms.Vorname LIKE :t
-    ORDER BY ms.Nachname, ms.Vorname
-  ");
-  $stmt->execute([':t'=>'%'.$term.'%']);
-  $out = [];
-  while ($r = $stmt->fetch(PDO::FETCH_ASSOC)) {
-    $out[] = [
-      'id' => (int)$r['id'],
-      'label' => $r['Nachname'].', '.$r['Vorname'].' ('.$r['pn'].')',
-      'pn' => $r['pn'],
-      'info' => [
-        'abteilung' => $r['Abteilung'],
-        'typ' => $r['Typ'],
-        'kategorie' => $r['Kategorie'],
-      ]
-    ];
+  $q          = trim((string)($_GET['q'] ?? ''));
+  $onlyActive = ($_GET['onlyActive'] ?? '1') === '1';
+
+  try {
+    $where = [];
+    $p = [];
+    if ($q !== '') {
+      // gleiche Suche, aber zwei Parameter-Namen verwenden (pdo_sqlsrv-Restriktion)
+      $where[]   = "(Vollname LIKE :qs1 OR Personalnummer LIKE :qs2)";
+      $p[':qs1'] = '%'.$q.'%';
+      $p[':qs2'] = '%'.$q.'%';
+    }
+    if ($onlyActive) {
+      $where[] = "Aktiv = 1";
+    }
+    $whereSql = $where ? 'WHERE '.implode(' AND ', $where) : '';
+
+    $sql = "
+      SELECT TOP (20)
+        MitarbeiterID, Personalnummer, Vollname, Abteilung, MitarbeiterTyp, MitarbeiterKategorie
+      FROM dbo.vw_Mitarbeiter_Liste
+      $whereSql
+      ORDER BY Vollname ASC
+    ";
+    $st = $pdo->prepare($sql);
+    $st->execute($p);
+    echo json_encode(['ok'=>true,'data'=>$st->fetchAll(PDO::FETCH_ASSOC)], JSON_UNESCAPED_UNICODE);
+  } catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['ok'=>false,'error'=>$e->getMessage()]);
   }
-  echo json_encode($out, JSON_UNESCAPED_UNICODE);
   exit;
 }
 
-/* ========= Parametrisierung: neu vs. edit ========= */
-$editId = isset($_GET['edit']) ? (int)$_GET['edit'] : 0;
-$typ = $_GET['typ'] ?? '';
-if ($editId > 0) {
-  $row = $pdo->prepare("SELECT * FROM dbo.MitarbeiterBestellungKopf WHERE BestellungID = :id");
-  $row->execute([':id'=>$editId]);
-  $kopf = $row->fetch(PDO::FETCH_ASSOC);
-  if (!$kopf) { http_response_code(404); exit('Bestellung nicht gefunden.'); }
-  $typ = $kopf['Typ'];
-  if ($typ!=='A' && $typ!=='R') { http_response_code(400); exit('Ungültiger Typ.'); }
-} else {
-  if ($typ!=='A' && $typ!=='R') { http_response_code(400); exit('Parameter typ=A|R erforderlich.'); }
-  $kopf = null;
-}
-
-/* ========= Mitarbeiter-Info (bei Edit) ========= */
-$mitarbeiterInfo = null;
-if ($kopf) {
-  $st = $pdo->prepare("
-    SELECT ms.MitarbeiterID, ms.Personalnummer, ms.Nachname, ms.Vorname, ms.Abteilung,
-           mt.Bezeichnung AS Typ, mk.Bezeichnung AS Kategorie
-    FROM dbo.MitarbeiterStamm ms
-    JOIN dbo.MitarbeiterTyp mt ON mt.TypID = ms.MitarbeiterTypID
-    JOIN dbo.MitarbeiterKategorie mk ON mk.KategorieID = ms.MitarbeiterKategorieID
-    WHERE ms.MitarbeiterID = :id
-  ");
-  $st->execute([':id'=>$kopf['MitarbeiterID']]);
-  $mitarbeiterInfo = $st->fetch(PDO::FETCH_ASSOC);
-}
-
-/* ========= Daten für Kaskaden (Ausgabe) ========= */
-$gruppen = $pdo->query("SELECT MaterialgruppeID AS id, Gruppenname AS name FROM dbo.Materialgruppe ORDER BY Gruppenname")->fetchAll(PDO::FETCH_ASSOC);
-$materialRaw = $pdo->query("
-  SELECT m.MaterialID AS id, m.MaterialName AS name, m.MaterialgruppeID AS gid, m.HerstellerID AS hid
-  FROM dbo.Material m
-  ORDER BY m.MaterialName
-")->fetchAll(PDO::FETCH_ASSOC);
-$herstellerRaw = $pdo->query("
-  SELECT DISTINCT m.MaterialgruppeID AS gid, h.HerstellerID AS id, h.Name AS name
-  FROM dbo.Material m
-  JOIN dbo.Hersteller h ON h.HerstellerID = m.HerstellerID
-  WHERE m.MaterialgruppeID IS NOT NULL AND m.HerstellerID IS NOT NULL
-  ORDER BY h.Name
-")->fetchAll(PDO::FETCH_ASSOC);
-$variantenRaw = $pdo->query("
-  SELECT v.VarianteID AS id, v.VariantenBezeichnung AS name, v.MaterialID AS mid
-  FROM dbo.MatVarianten v
-  ORDER BY v.VariantenBezeichnung
-")->fetchAll(PDO::FETCH_ASSOC);
-
-/* ========= Daten für Kaskaden (Rückgabe – harte Begrenzung) ========= */
-$offenByEmp = [];
-if ($typ==='R') {
-  $empId = $kopf['MitarbeiterID'] ?? 0; // Bei Neuanlage erst nach Auswahl verfügbar (AJAX)
-  if ($empId) {
-    $st = $pdo->prepare("
-      SELECT avo.VarianteID, avo.Offen,
-             v.MaterialID, m.MaterialgruppeID AS gid, m.HerstellerID AS hid
-      FROM dbo.v_Mitarbeiter_AusgabeOffen avo
-      JOIN dbo.MatVarianten v ON v.VarianteID = avo.VarianteID
-      JOIN dbo.Material m ON m.MaterialID = v.MaterialID
-      WHERE avo.MitarbeiterID = :mid
-    ");
-    $st->execute([':mid'=>$empId]);
-    $off = $st->fetchAll(PDO::FETCH_ASSOC);
-    foreach ($off as $x) {
-      $offenByEmp[(int)$x['VarianteID']] = [
-        'offen'=>(float)$x['Offen'], 'mid'=>(int)$x['MaterialID'],
-        'gid'=>(int)$x['gid'], 'hid'=>(int)$x['hid']
-      ];
-    }
-  }
-}
-
-/* ========= Bestehende Positionen (bei Edit) ========= */
-$posRows = [];
-if ($kopf) {
-  $ps = $pdo->prepare("
-    SELECT p.PosNr, p.VarianteID, p.Menge, v.MaterialID, m.MaterialgruppeID AS gid, m.HerstellerID AS hid
-    FROM dbo.MitarbeiterBestellungPos p
-    JOIN dbo.MatVarianten v ON v.VarianteID = p.VarianteID
-    JOIN dbo.Material m ON m.MaterialID = v.MaterialID
-    WHERE p.BestellungID = :bid
-    ORDER BY p.PosNr
-  ");
-  $ps->execute([':bid'=>$kopf['BestellungID']]);
-  $posRows = $ps->fetchAll(PDO::FETCH_ASSOC);
-}
-
-/* ========= POST: Speichern ========= */
-$errors = [];
-if (($_POST['action'] ?? '') === 'save') {
-  $val = [
-    'csrf' => $_POST['csrf'] ?? '',
-    'typ'  => $_POST['typ'] ?? '',
-    'mid'  => (int)($_POST['MitarbeiterID'] ?? 0),
-    'grund'=> trim((string)($_POST['RueckgabeGrund'] ?? '')),
-    'hinweis'=> trim((string)($_POST['Hinweis'] ?? '')),
-  ];
-  $pos = $_POST['pos'] ?? []; if (!is_array($pos)) $pos=[];
-  if (!csrf_check($val['csrf'])) { $errors['_']='Sicherheits-Token ungültig. Bitte Seite neu laden.'; }
-
-  if ($val['typ']!=='A' && $val['typ']!=='R') $errors['_']='Ungültiger Typ.';
-  if ($val['mid']<=0) $errors['MitarbeiterID']='Bitte Mitarbeiter auswählen.';
-  if ($val['typ']==='R' && $val['grund']==='') $errors['RueckgabeGrund']='Bitte Rückgabegrund angeben.';
-
-  $clean = []; $ix=0;
-  foreach ($pos as $i=>$p) {
-    $gid=(int)($p['gid']??0); $hid=(int)($p['hid']??0); $mid=(int)($p['mid']??0); $vid=(int)($p['vid']??0);
-    $qty=(string)($p['qty']??'');
-    if ($gid<=0 && $hid<=0 && $mid<=0 && $vid<=0 && trim($qty)==='') continue;
-    if ($gid<=0 || $hid<=0 || $mid<=0 || $vid<=0) { $errors["pos_$i"]='Bitte Kategorie/Hersteller/Artikel/Variante wählen.'; continue; }
-    if ($qty==='' || !is_numeric($qty) || (float)$qty<=0) { $errors["pos_$i"]=($errors["pos_$i"]??'').' Menge > 0 erforderlich.'; continue; }
-    $ix++; $clean[]=['pos'=>$ix,'vid'=>$vid,'qty'=>(float)$qty];
-  }
-  if (!$clean) $errors['pos']='Mindestens eine Position erfassen.';
-
-  if ($val['typ']==='R' && $val['mid']>0) {
-    // Serverseitige Zusatzprüfung gegen View (redundant zum DB-Trigger, aber bessere UX)
-    $stmt = $pdo->prepare("
-      SELECT avo.VarianteID, avo.Offen
-      FROM dbo.v_Mitarbeiter_AusgabeOffen avo
-      WHERE avo.MitarbeiterID = :mid AND avo.VarianteID = :vid
-    ");
-    foreach ($clean as $c) {
-      $stmt->execute([':mid'=>$val['mid'], ':vid'=>$c['vid']]);
-      $r = $stmt->fetch(PDO::FETCH_ASSOC);
-      if (!$r) { $errors['pos']='Eine Variante ist für diesen Mitarbeiter nicht rückgabefähig.'; break; }
-      if ($c['qty'] > (float)$r['Offen']) { $errors['pos']='Rückgabemenge überschreitet offene Menge.'; break; }
-    }
-  }
-
-  if (!$errors) {
-    try {
-      $pdo->beginTransaction();
-
-      $createdBy = windows_user();
-
-      if ($editId>0) {
-        // Update Kopf
-        $stmt = $pdo->prepare("
-          UPDATE dbo.MitarbeiterBestellungKopf
-            SET Typ = :typ, MitarbeiterID = :mid, Hinweis = :hinweis,
-                RueckgabeGrund = :grund
-          WHERE BestellungID = :id
-        ");
-        $stmt->execute([
-          ':typ'=>$val['typ'], ':mid'=>$val['mid'],
-          ':hinweis'=>($val['hinweis']===''?null:$val['hinweis']),
-          ':grund'=>($val['typ']==='R' ? $val['grund'] : null),
-          ':id'=>$editId
-        ]);
-
-        // Positionen neu aufbauen
-        $pdo->prepare("DELETE FROM dbo.MitarbeiterBestellungPos WHERE BestellungID = :id")->execute([':id'=>$editId]);
-        $ins = $pdo->prepare("INSERT INTO dbo.MitarbeiterBestellungPos (BestellungID, PosNr, VarianteID, Menge) VALUES (:bid,:pos,:vid,:qty)");
-        foreach ($clean as $c) $ins->execute([':bid'=>$editId, ':pos'=>$c['pos'], ':vid'=>$c['vid'], ':qty'=>$c['qty']]);
-
-        $pdo->commit();
-        flash('success','Bestellung wurde aktualisiert.');
-        header('Location: ?p=ausgabe'); exit;
-
-      } else {
-        // Neue BestellNr
-        $proc = $pdo->prepare("DECLARE @nr NVARCHAR(40); EXEC dbo.sp_NextBelegNr @Vorgang=:v, @BelegNr=@nr OUTPUT; SELECT @nr;");
-        $proc->execute([':v'=>$val['typ']==='A'?'AO':'RO']);
-        $bestellNr = (string)$proc->fetchColumn();
-
-        // Kopf anlegen
-        $stmt = $pdo->prepare("
-          INSERT INTO dbo.MitarbeiterBestellungKopf
-            (BestellNr, Typ, MitarbeiterID, BestellDatum, Status, Hinweis, RueckgabeGrund, CreatedAt, CreatedBy)
-          VALUES
-            (:nr, :typ, :mid, SYSUTCDATETIME(), 0, :hinweis, :grund, SYSUTCDATETIME(), :by);
-          SELECT SCOPE_IDENTITY();
-        ");
-        $stmt->execute([
-          ':nr'=>$bestellNr, ':typ'=>$val['typ'], ':mid'=>$val['mid'],
-          ':hinweis'=>($val['hinweis']===''?null:$val['hinweis']),
-          ':grund'=>($val['typ']==='R' ? $val['grund'] : null),
-          ':by'=>$createdBy
-        ]);
-        $bid = (int)$stmt->fetchColumn();
-
-        // Positionen
-        $ins = $pdo->prepare("INSERT INTO dbo.MitarbeiterBestellungPos (BestellungID, PosNr, VarianteID, Menge) VALUES (:bid,:pos,:vid,:qty)");
-        foreach ($clean as $c) $ins->execute([':bid'=>$bid, ':pos'=>$c['pos'], ':vid'=>$c['vid'], ':qty'=>$c['qty']]);
-
-        $pdo->commit();
-        flash('success','Bestellung wurde angelegt. Nr: '.$bestellNr);
-        header('Location: ?p=ausgabe'); exit;
+/* ============================================================
+   AJAX: abhängige Dropdowns (Gruppe -> Hersteller -> Material -> Variante)
+   ============================================================ */
+if (isset($_GET['ajax']) && $_GET['ajax'] === '1') {
+  header('Content-Type: application/json; charset=utf-8');
+  $action = $_GET['action'] ?? '';
+  try {
+    switch ($action) {
+      /* ---------- Materialgruppen ---------- */
+      case 'list_groups': {
+        $st = $pdo->query("SELECT MaterialgruppeID AS id, Gruppenname AS text FROM dbo.Materialgruppe ORDER BY Gruppenname");
+        echo json_encode(['ok'=>true,'data'=>$st->fetchAll(PDO::FETCH_ASSOC)], JSON_UNESCAPED_UNICODE);
+        break;
       }
-    } catch (Throwable $e) {
-      if ($pdo->inTransaction()) $pdo->rollBack();
-      $errors['_'] = 'Speichern fehlgeschlagen: '.$e->getMessage();
+
+      /* ---------- Hersteller (LEFT JOIN; inkl. „ohne Hersteller“) ---------- */
+      case 'list_manu': {
+        $gid = isset($_GET['gid']) ? (int)$_GET['gid'] : 0;
+        $gidParam = $gid > 0 ? $gid : null;
+
+        $sql = "
+          SELECT DISTINCT
+            ISNULL(h.HerstellerID, 0)          AS id,
+            ISNULL(h.Name, N'ohne Hersteller') AS text
+          FROM dbo.Material m
+          LEFT JOIN dbo.Hersteller h
+            ON h.HerstellerID = m.HerstellerID
+          WHERE (m.MaterialgruppeID = COALESCE(:gid1, m.MaterialgruppeID))
+          ORDER BY text
+        ";
+        $st = $pdo->prepare($sql);
+        if ($gidParam === null) {
+          $st->bindValue(':gid1', null, PDO::PARAM_NULL);
+        } else {
+          $st->bindValue(':gid1', $gidParam, PDO::PARAM_INT);
+        }
+        $st->execute();
+        echo json_encode(['ok'=>true,'data'=>$st->fetchAll(PDO::FETCH_ASSOC)], JSON_UNESCAPED_UNICODE);
+        break;
+      }
+
+      /* ---------- Materialien (Filter: Gruppe + Hersteller inkl. NULL) ---------- */
+      case 'list_mat': {
+        $gid = isset($_GET['gid']) ? (int)$_GET['gid'] : 0;
+        $hid = isset($_GET['hid']) ? (int)$_GET['hid'] : -99999; // -99999 = „none“ (kein Filter)
+
+        $gidParam = $gid > 0 ? $gid : null;
+
+        // drei Modi: none / null / id
+        $hidMode = 'none';
+        $hidVal  = null;
+        if ($hid === 0) {           // 0 steht für „ohne Hersteller“
+          $hidMode = 'null';
+        } elseif ($hid > 0) {       // konkreter Hersteller
+          $hidMode = 'id';
+          $hidVal  = $hid;
+        }
+
+        $sql = "
+          SELECT m.MaterialID AS id, m.MaterialName AS text
+          FROM dbo.Material m
+          WHERE m.IsActive = 1
+            AND (m.MaterialgruppeID = COALESCE(:gid1, m.MaterialgruppeID))
+            AND (
+                 (:hidMode1 = 'none')
+              OR (:hidMode2 = 'null' AND m.HerstellerID IS NULL)
+              OR (:hidMode3 = 'id'   AND m.HerstellerID = :hidVal1)
+            )
+          ORDER BY m.MaterialName
+        ";
+        $st = $pdo->prepare($sql);
+
+        // :gid1
+        if ($gidParam === null) {
+          $st->bindValue(':gid1', null, PDO::PARAM_NULL);
+        } else {
+          $st->bindValue(':gid1', $gidParam, PDO::PARAM_INT);
+        }
+        // :hidMode1/2/3 getrennt binden (pdo_sqlsrv möchte Parameter nicht mehrfach)
+        $st->bindValue(':hidMode1', $hidMode, PDO::PARAM_STR);
+        $st->bindValue(':hidMode2', $hidMode, PDO::PARAM_STR);
+        $st->bindValue(':hidMode3', $hidMode, PDO::PARAM_STR);
+        // :hidVal1
+        if ($hidVal === null) {
+          $st->bindValue(':hidVal1', null, PDO::PARAM_NULL);
+        } else {
+          $st->bindValue(':hidVal1', $hidVal, PDO::PARAM_INT);
+        }
+
+        $st->execute();
+        echo json_encode(['ok'=>true,'data'=>$st->fetchAll(PDO::FETCH_ASSOC)], JSON_UNESCAPED_UNICODE);
+        break;
+      }
+
+      /* ---------- Varianten (inkl. Farbe/Größe) ---------- */
+      case 'list_var': {
+        $mid = isset($_GET['mid']) ? (int)$_GET['mid'] : 0;
+        if ($mid <= 0) {
+          echo json_encode(['ok'=>true,'data'=>[]]);
+          break;
+        }
+        $sql = "
+          SELECT v.VarianteID AS id,
+                 v.VariantenBezeichnung AS bez,
+                 v.SKU,
+                 p.Farbe,
+                 p.Groesse
+          FROM dbo.MatVarianten v
+          LEFT JOIN dbo.vVarAttr_Pivot_Arbeitskleidung p
+            ON p.VarianteID = v.VarianteID
+          WHERE v.MaterialID = :mid1 AND v.IsActive = 1
+          ORDER BY v.VariantenBezeichnung
+        ";
+        $st = $pdo->prepare($sql);
+        $st->bindValue(':mid1', $mid, PDO::PARAM_INT);
+        $st->execute();
+
+        $rows = [];
+        while ($r = $st->fetch(PDO::FETCH_ASSOC)) {
+          $fg = trim((string)($r['Farbe']   ?? ''));
+          $gr = trim((string)($r['Groesse'] ?? ''));
+          $parts = [];
+          if ($fg !== '') $parts[] = $fg;
+          if ($gr !== '') $parts[] = $gr;
+          $prefix = $parts ? implode(', ', $parts) . ' — ' : '';
+          $rows[] = ['id' => (int)$r['id'], 'text' => $prefix . (string)$r['bez']];
+        }
+        echo json_encode(['ok'=>true,'data'=>$rows], JSON_UNESCAPED_UNICODE);
+        break;
+      }
+
+      default:
+        echo json_encode(['ok'=>false,'error'=>'Unbekannte Aktion']);
+    }
+  } catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['ok'=>false,'error'=>$e->getMessage()]);
+  }
+  exit;
+}
+
+/* ============================================================
+   POST: Bestellung (Typ A) mit Positionen anlegen
+   ============================================================ */
+$errors = [];
+
+if (($_POST['action'] ?? '') === 'create_order') {
+  $csrf = $_POST['csrf'] ?? '';
+  if (!csrf_check_local($csrf)) {
+    $errors['_'] = 'Sicherheits-Token ungültig. Bitte Seite neu laden.';
+  } else {
+    $mitarbeiterId = (int)($_POST['MitarbeiterID'] ?? 0);
+    if ($mitarbeiterId <= 0) {
+      $errors['MitarbeiterID'] = 'Bitte einen Mitarbeiter auswählen.';
+    } else {
+      $chk = $pdo->prepare("SELECT 1 FROM dbo.MitarbeiterStamm WHERE MitarbeiterID = :id1");
+      $chk->execute([':id1' => $mitarbeiterId]);
+      if (!$chk->fetchColumn()) {
+        $errors['MitarbeiterID'] = 'Mitarbeiter nicht gefunden.';
+      }
+    }
+
+    // Positionswerte
+    $pos_variante = $_POST['pos_variante'] ?? [];
+    $pos_menge    = $_POST['pos_menge'] ?? [];
+
+    $posCount = 0;
+    for ($i=0; $i < max(count($pos_variante), count($pos_menge)); $i++) {
+      $vid = isset($pos_variante[$i]) ? (int)$pos_variante[$i] : 0;
+      $mengeRaw = trim((string)($pos_menge[$i] ?? ''));
+      if ($vid > 0 && $mengeRaw !== '') {
+        $menge = (float)str_replace(',', '.', $mengeRaw);
+        if ($menge > 0) $posCount++;
+      }
+    }
+    if ($posCount === 0) {
+      $errors['pos'] = 'Bitte mindestens eine Position mit Variante und Menge erfassen.';
+    }
+
+    if (!$errors) {
+      try {
+        $pdo->beginTransaction();
+
+        // 1) Bestellnummer ziehen (AB = Ausgabe-Bestellung) – per EXEC + SELECT und nextRowset()
+        $stmtNr = $pdo->prepare("
+          DECLARE @nr NVARCHAR(40);
+          EXEC dbo.sp_NextBelegNr @Vorgang = :v1, @BelegNr = @nr OUTPUT;
+          SELECT @nr AS BelegNr;
+        ");
+        $stmtNr->execute([':v1' => 'AB']);
+
+        // Auf das Resultset mit Spalten springen
+        if ($stmtNr->columnCount() === 0) {
+          while ($stmtNr->nextRowset()) {
+            if ($stmtNr->columnCount() > 0) break;
+          }
+        }
+        $bestellNr = (string)$stmtNr->fetchColumn();
+        if ($bestellNr === '' || $bestellNr === null) {
+          throw new RuntimeException('Konnte keine Bestellnummer erzeugen.');
+        }
+
+        // 2) Kopf anlegen – KEIN OUTPUT (Trigger vorhanden). Stattdessen: SCOPE_IDENTITY holen.
+        $sqlInsK = "
+          INSERT INTO dbo.MitarbeiterBestellungKopf
+            (BestellNr, Typ, MitarbeiterID, BestellDatum, Status, RueckgabeGrund, CreatedAt, CreatedBy)
+          VALUES (:bnr1, 'A', :mid1, SYSUTCDATETIME(), 0, NULL, SYSUTCDATETIME(), :cby1);
+          SELECT CAST(SCOPE_IDENTITY() AS int) AS NewID;
+        ";
+        $stK = $pdo->prepare($sqlInsK);
+        $stK->execute([
+          ':bnr1' => $bestellNr,
+          ':mid1' => $mitarbeiterId,
+          ':cby1' => current_login()
+        ]);
+        // Falls der Treiber zuerst ein leeres Rowset liefert, weiterklicken
+        if ($stK->columnCount() === 0) {
+          while ($stK->nextRowset()) {
+            if ($stK->columnCount() > 0) break;
+          }
+        }
+        $bestellungId = (int)$stK->fetchColumn();
+        if ($bestellungId <= 0) {
+          throw new RuntimeException('Konnte Bestellung-Kopf-ID nicht ermitteln.');
+        }
+
+        // 3) Positionen anlegen
+        $sqlInsP = "
+          INSERT INTO dbo.MitarbeiterBestellungPos (BestellungID, PosNr, VarianteID, Menge)
+          VALUES (:bid1, :pos1, :vid1, :menge1);
+        ";
+        $spi = $pdo->prepare($sqlInsP);
+
+        $posNr = 0;
+        for ($i=0; $i < max(count($pos_variante), count($pos_menge)); $i++) {
+          $vid = isset($pos_variante[$i]) ? (int)$pos_variante[$i] : 0;
+          $mengeRaw = trim((string)($pos_menge[$i] ?? ''));
+          if ($vid <= 0 || $mengeRaw === '') continue;
+
+          $menge = (float)str_replace(',', '.', $mengeRaw);
+          if ($menge <= 0) continue;
+
+          $chkV = $pdo->prepare("SELECT 1 FROM dbo.MatVarianten WHERE VarianteID = :vid2");
+          $chkV->execute([':vid2'=>$vid]);
+          if (!$chkV->fetchColumn()) {
+            throw new RuntimeException('Ungültige Variante-ID in einer Position.');
+          }
+
+          $posNr++;
+          $spi->execute([
+            ':bid1'   => $bestellungId,
+            ':pos1'   => $posNr,
+            ':vid1'   => $vid,
+            ':menge1' => $menge,
+          ]);
+        }
+
+        if ($posNr === 0) {
+          throw new RuntimeException('Keine gültigen Positionen gefunden.');
+        }
+
+        $pdo->commit();
+
+        $_SESSION['flash_success'] = 'Bestellung '.$bestellNr.' wurde angelegt ('.$posNr.' Pos.).';
+        header('Location: '.rtrim(base_url(), '/').'/?p=ausgabe');
+        exit;
+      } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        $errors['_'] = 'Speichern fehlgeschlagen: '.$e->getMessage();
+      }
     }
   }
 }
 
-/* ========= UI ========= */
-$title = ($typ==='A' ? ($editId?'Bestellung bearbeiten':'Neue Bestellung (Ausgabe)') : ($editId?'Rückgabe bearbeiten':'Neue Rückgabe (Bestellung)'));
-require __DIR__.'/../layout.php';
-layout_header($title);
+/* ============================================================
+   UI
+   ============================================================ */
+layout_header('Ausgabe – Neue Bestellung', 'ausgabe');
 ?>
   <div class="card">
-    <h1><?= e($title) ?></h1>
+    <h1>Neue Bestellung (Ausgabe)</h1>
+    <div class="hint">Wähle den Mitarbeiter und erfasse darunter die Positionen. Die Bestellnummer wird automatisch vergeben.</div>
+  </div>
 
-    <?php if (!empty($errors['_'])): ?>
-      <div class="alert alert-error"><?= e($errors['_']) ?></div>
-    <?php endif; ?>
+  <div class="split">
+    <div class="card">
+      <h2>Kopfdaten</h2>
 
-    <form method="post" id="form">
-      <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
-      <input type="hidden" name="action" value="save">
-      <input type="hidden" name="typ" value="<?= e($typ) ?>">
-
-      <div class="grid2">
-        <div>
-          <label for="mit_search">Mitarbeiter suchen</label>
-          <div style="display:flex;gap:8px">
-            <input type="text" id="mit_search" placeholder="Name oder Personalnummer...">
-            <button type="button" class="btn btn-secondary" id="mit_clear">Zurücksetzen</button>
-          </div>
-          <input type="hidden" name="MitarbeiterID" id="MitarbeiterID" value="<?= e($kopf['MitarbeiterID'] ?? '') ?>">
-          <?php if (!empty($errors['MitarbeiterID'])): ?><div class="alert alert-error"><?= e($errors['MitarbeiterID']) ?></div><?php endif; ?>
-          <div id="mit_result" class="hint" style="margin-top:.3rem">
-            <?php if ($mitarbeiterInfo): ?>
-              Gewählt: <strong><?= e($mitarbeiterInfo['Nachname'].', '.$mitarbeiterInfo['Vorname'].' ('.$mitarbeiterInfo['Personalnummer'].')') ?></strong>
-            <?php else: ?>
-              Noch kein Mitarbeiter gewählt.
-            <?php endif; ?>
-          </div>
-        </div>
-
-        <div>
-          <label for="Hinweis">Hinweis</label>
-          <input type="text" id="Hinweis" name="Hinweis" value="<?= e($kopf['Hinweis'] ?? '') ?>">
-        </div>
-      </div>
-
-      <?php if ($typ==='R'): ?>
-        <div class="grid1">
-          <div>
-            <label for="RueckgabeGrund">Rückgabegrund *</label>
-            <input type="text" id="RueckgabeGrund" name="RueckgabeGrund" required value="<?= e($kopf['RueckgabeGrund'] ?? '') ?>">
-            <?php if (!empty($errors['RueckgabeGrund'])): ?><div class="alert alert-error"><?= e($errors['RueckgabeGrund']) ?></div><?php endif; ?>
-          </div>
-        </div>
+      <?php if (!empty($errors['_'])): ?>
+        <div class="alert alert-error"><?= e($errors['_']) ?></div>
       <?php endif; ?>
 
-      <h2 style="margin-top:1rem">Positionen</h2>
-      <?php if (!empty($errors['pos'])): ?><div class="alert alert-error"><?= e($errors['pos']) ?></div><?php endif; ?>
+      <form method="post" id="form-create-order" class="grid1" autocomplete="off">
+        <input type="hidden" name="csrf" value="<?= e(csrf_token_local()) ?>">
+        <input type="hidden" name="action" value="create_order">
+        <input type="hidden" id="emp-id" name="MitarbeiterID" value="">
 
-      <table id="posTable">
-        <thead>
-          <tr>
-            <th style="width:70px">Pos.</th>
-            <th>Kategorie</th>
-            <th>Hersteller</th>
-            <th>Artikel</th>
-            <th>Variante</th>
-            <th style="width:140px">Menge</th>
-            <th style="width:60px"></th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+        <div>
+          <label for="emp-search">Mitarbeiter suchen *</label>
+          <input type="text" id="emp-search" placeholder="Nachname, Vorname oder Personalnummer">
+          <?php if (!empty($errors['MitarbeiterID'])): ?>
+            <div class="alert alert-error"><?= e($errors['MitarbeiterID']) ?></div>
+          <?php endif; ?>
+          <div id="emp-suggest" style="position:relative;margin-top:6px;">
+            <div id="emp-suggest-list" style="position:absolute;z-index:10;left:0;right:0;background:#fff;border:1px solid var(--border);border-radius:10px;display:none;max-height:260px;overflow:auto"></div>
+          </div>
+          <div id="emp-info" class="hint" style="margin-top:10px;display:none"></div>
+        </div>
 
-      <div style="margin-top:.6rem;display:flex;gap:8px">
-        <button class="btn btn-secondary" type="button" id="addRowBtn">+ Position</button>
-        <button class="btn btn-primary" type="submit">Speichern</button>
-        <a class="btn btn-secondary" href="?p=ausgabe">Verwerfen</a>
-      </div>
-    </form>
+        <h2>Positionsdaten</h2>
+        <?php if (!empty($errors['pos'])): ?>
+          <div class="alert alert-error"><?= e($errors['pos']) ?></div>
+        <?php endif; ?>
+
+        <table id="pos-table">
+          <thead>
+            <tr>
+              <th style="width:4rem;">Pos.</th>
+              <th>Kategorie</th>
+              <th>Hersteller</th>
+              <th>Artikel</th>
+              <th>Variante</th>
+              <th style="width:9rem;">Menge</th>
+              <th style="width:3rem;"></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+
+        <div style="margin-top:8px; display:flex; gap:8px;">
+          <button type="button" class="btn btn-secondary" id="btn-add-row">Position hinzufügen</button>
+          <button type="submit" class="btn btn-primary">Bestellung speichern</button>
+          <a class="btn btn-secondary" href="<?= e(base_url()) ?>/?p=ausgabe">Abbrechen</a>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Hinweise</h2>
+      <ul>
+        <li>Bestellnummer per <code>EXEC…; SELECT…;</code> + <code>nextRowset()</code> ausgelesen.</li>
+        <li>Kopf-ID per <code>SCOPE_IDENTITY()</code> selektiert (verträglich mit Triggern).</li>
+        <li>Alle SQL-Parameter eindeutig benannt (verhindert SQLSTATE[07002]).</li>
+      </ul>
+    </div>
   </div>
 
   <script>
-  (function(){
-    const TYP = <?= json_encode($typ) ?>;
-    const EDIT = <?= json_encode($editId>0) ?>;
+    (function(){
+      function toast(msg){ console.error(msg); }
 
-    const groups = <?= json_encode($gruppen, JSON_UNESCAPED_UNICODE) ?>;
-    const mats = <?= json_encode($materialRaw, JSON_UNESCAPED_UNICODE) ?>;
-    const mans = <?= json_encode($herstellerRaw, JSON_UNESCAPED_UNICODE) ?>;
-    const varsAll = <?= json_encode($variantenRaw, JSON_UNESCAPED_UNICODE) ?>;
+      // ---- Mitarbeiter-Suche ----
+      const $q   = document.getElementById('emp-search');
+      const $hid = document.getElementById('emp-id');
+      const $box = document.getElementById('emp-suggest-list');
+      const $inf = document.getElementById('emp-info');
+      let ctrl = null, blurHideTimer = null;
 
-    // bei Typ R: bereits geladene "offen"-Varianten (nur bei Edit vorhanden)
-    const offenMap = <?= json_encode($offenByEmp, JSON_UNESCAPED_UNICODE) ?>;
-
-    // bestehende Positionen (bei Edit)
-    const postedRows = <?= json_encode($posRows, JSON_UNESCAPED_UNICODE) ?>;
-
-    // state: Mitarbeiter & "offen" (wird nach Auswahl via AJAX geladen)
-    let currentEmployeeId = <?= (int)($kopf['MitarbeiterID'] ?? 0) ?>;
-    let offenByVarianteId = {...offenMap}; // {vid: {offen, mid, gid, hid}}
-
-    // Helpers
-    function el(tag, attrs={}, children=[]){
-      const e = document.createElement(tag);
-      for (const [k,v] of Object.entries(attrs)) {
-        if (k==='class') e.className = v;
-        else if (k==='value') e.value = v;
-        else e.setAttribute(k, v);
-      }
-      (Array.isArray(children)?children:[children]).forEach(c=>{
-        if (c===null||c===undefined) return;
-        e.appendChild(typeof c==='string'?document.createTextNode(c):c);
-      });
-      return e;
-    }
-    function buildSelect(options, placeholder='— bitte wählen —', value=''){
-      const sel = el('select');
-      sel.appendChild(el('option', {value:''}, placeholder));
-      options.forEach(o=>{
-        const opt = el('option', {value:String(o.id)}, o.name ?? o.label ?? String(o.id));
-        if (String(value)===String(o.id)) opt.selected = true;
-        sel.appendChild(opt);
-      });
-      return sel;
-    }
-
-    // Kaskaden-Quellen
-    function herstellerByGroup(gid){
-      return mans.filter(x=>String(x.gid)===String(gid));
-    }
-    function materialsByGH(gid, hid){
-      return mats.filter(x=>String(x.gid)===String(gid) && String(x.hid)===String(hid));
-    }
-    function variantsByMaterial(mid){
-      return varsAll.filter(x=>String(x.mid)===String(mid));
-    }
-
-    // Für Rückgabe: gefilterte Varianten & Kaskaden aus offenByVarianteId
-    function filteredCascade(){
-      const vids = Object.keys(offenByVarianteId).map(Number);
-      const set = new Set(vids);
-      const fVars = varsAll.filter(v=>set.has(Number(v.id)));
-      const fMids = new Set(fVars.map(v=>Number(v.mid)));
-      const matsF = mats.filter(m=>fMids.has(Number(m.id)));
-
-      const gids = new Set(matsF.map(m=>Number(m.gid)));
-      const groupsF = groups.filter(g=>gids.has(Number(g.id)));
-
-      const pairGH = new Set(matsF.map(m=>m.gid+'|'+m.hid));
-      const mansF = mans.filter(h=>pairGH.has(h.gid+'|'+h.id));
-
-      return {groupsF, mansF, matsF, fVars};
-    }
-
-    // Tabelle
-    const tbody = document.querySelector('#posTable tbody');
-    const addBtn = document.getElementById('addRowBtn');
-
-    function renumber(){
-      [...tbody.querySelectorAll('tr')].forEach((tr, i)=>{
-        tr.querySelector('.pos-cell').textContent = (i+1);
-        tr.querySelectorAll('select, input').forEach(inp=>{
-          const name = inp.getAttribute('name'); if (!name) return;
-          const newName = name.replace(/pos\[\d+\]/, 'pos['+(i)+']');
-          inp.setAttribute('name', newName);
-        });
-      });
-    }
-
-    function addRow(pref=null){
-      const idx = tbody.querySelectorAll('tr').length;
-      const tr = el('tr');
-      const tdPos = el('td', {class:'pos-cell'});
-      const tdG = el('td'), tdH=el('td'), tdM=el('td'), tdV=el('td'), tdQ=el('td'), tdX=el('td');
-
-      let selG, selH, selM, selV, inpQ;
-
-      function buildInitial(){
-        if (TYP==='R' && currentEmployeeId>0) {
-          const {groupsF, mansF, matsF, fVars} = filteredCascade();
-          selG = buildSelect(groupsF, '— bitte wählen —', pref?.gid || '');
-          selH = buildSelect([], '— bitte wählen —', pref?.hid || '');
-          selM = buildSelect([], '— bitte wählen —', pref?.mid || '');
-          selV = buildSelect([], '— bitte wählen —', pref?.VarianteID || '');
-          // attach
-          tdG.appendChild(selG); tdH.appendChild(selH); tdM.appendChild(selM); tdV.appendChild(selV);
-          function onG(){
-            const gid = selG.value;
-            const opts = mansF.filter(h=>String(h.gid)===String(gid));
-            const n = buildSelect(opts, '— bitte wählen —', pref?.hid || '');
-            selH.replaceWith(n); selH=n; selH.name = `pos[${idx}][hid]`; selH.required=true;
-            selH.addEventListener('change', onH); onH();
-          }
-          function onH(){
-            const gid = selG.value, hid=selH.value;
-            const opts = matsF.filter(m=>String(m.gid)===String(gid)&&String(m.hid)===String(hid));
-            const n = buildSelect(opts, '— bitte wählen —', pref?.mid || '');
-            selM.replaceWith(n); selM=n; selM.name = `pos[${idx}][mid]`; selM.required=true;
-            selM.addEventListener('change', onM); onM();
-          }
-          function onM(){
-            const mid = selM.value;
-            const opts = fVars.filter(v=>String(v.mid)===String(mid)).map(v=>{
-              const off = offenByVarianteId[Number(v.id)]?.offen ?? null;
-              return {id:v.id, name: v.name + (off!=null?` (offen: ${off})`:``)};
-            });
-            const n = buildSelect(opts, '— bitte wählen —', pref?.VarianteID || '');
-            selV.replaceWith(n); selV=n; selV.name = `pos[${idx}][vid]`; selV.required=true;
-          }
-          selG.name = `pos[${idx}][gid]`; selG.required=true; selG.addEventListener('change', onG); onG();
+      function hideList(){ $box.style.display='none'; $box.innerHTML=''; }
+      function showList(items){
+        $box.innerHTML = '';
+        if (!items || items.length===0) {
+          const li = document.createElement('div');
+          li.className = 'muted'; li.style.padding='.5rem .75rem'; li.textContent = 'Keine Treffer';
+          $box.appendChild(li);
         } else {
-          selG = buildSelect(groups, '— bitte wählen —', pref?.gid || '');
-          selH = buildSelect([], '— bitte wählen —', pref?.hid || '');
-          selM = buildSelect([], '— bitte wählen —', pref?.mid || '');
-          selV = buildSelect([], '— bitte wählen —', pref?.VarianteID || '');
-          tdG.appendChild(selG); tdH.appendChild(selH); tdM.appendChild(selM); tdV.appendChild(selV);
-          function onG(){
-            selH = replaceSel(selH, herstellerByGroup(selG.value), pref?.hid || '', `pos[${idx}][hid]`);
-            selH.addEventListener('change', onH); onH();
-          }
-          function onH(){
-            selM = replaceSel(selM, materialsByGH(selG.value, selH.value), pref?.mid || '', `pos[${idx}][mid]`);
-            selM.addEventListener('change', onM); onM();
-          }
-          function onM(){
-            selV = replaceSel(selV, variantsByMaterial(selM.value), pref?.VarianteID || '', `pos[${idx}][vid]`);
-          }
-          selG.name = `pos[${idx}][gid]`; selG.required=true; selG.addEventListener('change', onG); onG();
-        }
-      }
-      function replaceSel(sel, options, value, name){
-        const n = buildSelect(options, '— bitte wählen —', value);
-        sel.replaceWith(n); n.name = name; n.required=true; return n;
-      }
-
-      inpQ = el('input', {type:'number', step:'0.001', min:'0.001', name:`pos[${idx}][qty]`, value:(pref?.Menge || '')});
-      if (TYP==='R') {
-        // Bei Rückgabe nach Auswahl Variante max = offene Menge setzen (dynamisch)
-        // Wird in onM() angezeigt; zum Zeitpunkt des Buildens noch unklar -> Nutzerhinweis via title
-        inpQ.title = 'Menge darf offene Menge nicht überschreiten.';
-      }
-
-      tdQ.appendChild(inpQ);
-      const btnDel = el('button', {type:'button', class:'btn btn-secondary'}, '–');
-      btnDel.addEventListener('click', ()=>{ tr.remove(); renumber(); });
-
-      tdX.appendChild(btnDel);
-      tr.appendChild(tdPos); tr.appendChild(tdG); tr.appendChild(tdH); tr.appendChild(tdM); tr.appendChild(tdV); tr.appendChild(tdQ); tr.appendChild(tdX);
-      tbody.appendChild(tr);
-      renumber();
-
-      buildInitial();
-    }
-
-    addBtn.addEventListener('click', ()=>addRow());
-    if (postedRows && postedRows.length) {
-      postedRows.forEach(r=> addRow(r));
-    } else {
-      addRow();
-    }
-
-    // Mitarbeiter-Suche
-    const inp = document.getElementById('mit_search');
-    const res = document.getElementById('mit_result');
-    const hid = document.getElementById('MitarbeiterID');
-    const btnClear = document.getElementById('mit_clear');
-
-    let timer=null;
-    function search(term){
-      fetch(`?p=ausgabe_bestellung_neu&action=employee_search&term=${encodeURIComponent(term)}&typ=${encodeURIComponent(TYP)}`)
-        .then(r=>r.json())
-        .then(list=>{
-          // Dropdown-artige Liste
-          res.innerHTML = '';
-          if (!Array.isArray(list) || list.length===0) { res.textContent = 'Keine Treffer.'; return; }
-          const ul = el('ul', {style:'list-style:none;padding:0;margin:.2rem 0;border:1px solid #e5e7eb;border-radius:8px;max-height:180px;overflow:auto'});
-          list.forEach(item=>{
-            const li = el('li',{style:'padding:.35rem .5rem;cursor:pointer'}, [
-              el('div',{}, item.label),
-              el('div',{class:'muted'}, `${item.info.abteilung ?? ''} • ${item.info.typ} • ${item.info.kategorie}`)
-            ]);
-            li.addEventListener('click', ()=>{
-              hid.value = String(item.id);
-              currentEmployeeId = Number(item.id);
-              res.innerHTML = `Gewählt: <strong>${item.label}</strong>`;
-              inp.value = '';
-              if (TYP==='R') reloadOffenForEmployee();
+          items.forEach(r => {
+            const row = document.createElement('div');
+            row.style.padding='.55rem .75rem';
+            row.style.cursor='pointer';
+            row.style.display='flex';
+            row.style.flexDirection='column';
+            row.addEventListener('mouseenter', () => { row.style.background = '#f3f4f6'; });
+            row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
+            row.addEventListener('click', () => {
+              $hid.value = String(r.MitarbeiterID);
+              $q.value   = (r.Vollname || '') + ' — ' + (r.Personalnummer || '');
+              $inf.style.display = 'block';
+              $inf.innerHTML = 'Ausgewählt: <strong>' + escapeHtml(r.Vollname||'') + '</strong>'
+                            + (r.Abteilung ? ' • Abteilung: ' + escapeHtml(r.Abteilung) : '')
+                            + (r.MitarbeiterTyp ? ' • Typ: ' + escapeHtml(r.MitarbeiterTyp) : '')
+                            + (r.MitarbeiterKategorie ? ' • Kategorie: ' + escapeHtml(r.MitarbeiterKategorie) : '');
+              hideList();
             });
-            ul.appendChild(li);
+            const line1 = document.createElement('div');
+            line1.innerHTML = '<strong>'+escapeHtml(r.Vollname||'')+'</strong>' + (r.Personalnummer ? ' — '+escapeHtml(r.Personalnummer) : '');
+            const line2 = document.createElement('div');
+            line2.className = 'muted';
+            line2.textContent = [r.Abteilung, r.MitarbeiterTyp, r.MitarbeiterKategorie].filter(Boolean).join(' • ');
+            row.appendChild(line1); row.appendChild(line2);
+            $box.appendChild(row);
           });
-          res.appendChild(ul);
-        })
-        .catch(()=>{ res.textContent='Fehler bei der Suche.'; });
-    }
-    inp.addEventListener('input', ()=>{
-      const t = inp.value.trim();
-      if (timer) clearTimeout(timer);
-      if (t.length<2) { res.textContent = 'Mind. 2 Zeichen eingeben.'; return; }
-      timer = setTimeout(()=>search(t), 250);
-    });
-    btnClear.addEventListener('click', ()=>{
-      hid.value=''; currentEmployeeId=0; inp.value=''; res.textContent='Noch kein Mitarbeiter gewählt.';
-      if (TYP==='R') { offenByVarianteId = {}; tbody.innerHTML=''; addRow(); }
-    });
+        }
+        $box.style.display = 'block';
+      }
+      function searchEmp(){
+        const val = $q.value.trim();
+        if (ctrl) ctrl.abort();
+        ctrl = new AbortController();
+        const url = new URL(window.location.href);
+        url.searchParams.set('ajax','1');
+        url.searchParams.set('action','search_emp');
+        url.searchParams.set('q', val);
+        url.searchParams.set('onlyActive','1');
+        fetch(url.toString(), { signal: ctrl.signal })
+          .then(r => r.json())
+          .then(j => { if (!j || !j.ok) { toast(j && j.error ? j.error : 'Suche fehlgeschlagen'); showList([]); return; } showList(j.data||[]); })
+          .catch(err => { toast(err); });
+      }
+      let t=null;
+      $q.addEventListener('input', () => { $hid.value=''; $inf.style.display='none'; clearTimeout(t); t=setTimeout(searchEmp, 180); });
+      $q.addEventListener('focus', () => { clearTimeout(blurHideTimer); if ($box.innerHTML.trim()!=='') $box.style.display='block'; if ($q.value.trim()===''){ clearTimeout(t); t=setTimeout(searchEmp, 10);} });
+      $q.addEventListener('blur',  () => { blurHideTimer = setTimeout(hideList, 150); });
 
-    function reloadOffenForEmployee(){
-      if (!currentEmployeeId) return;
-      fetch(`?p=ausgabe_bestellung_neu&ajax=offen&mid=${currentEmployeeId}`)
-        .then(r=>r.json())
-        .then(map=>{
-          offenByVarianteId = map || {};
-          tbody.innerHTML=''; addRow();
-        }).catch(()=>{});
-    }
+      function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-    // AJAX für offene Varianten (separater Endpunkt unten)
-  })();
+      // ---- Positions-Tabelle ----
+      const $tbody = document.querySelector('#pos-table tbody');
+      const $btnAdd = document.getElementById('btn-add-row');
+
+      function api(action, params={}){
+        const url = new URL(window.location.href);
+        url.searchParams.set('ajax','1');
+        url.searchParams.set('action', action);
+        Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,String(v)));
+        return fetch(url.toString()).then(r=>r.json());
+      }
+
+      function option(el, val, txt){
+        const o = document.createElement('option');
+        o.value = val; o.textContent = txt;
+        el.appendChild(o);
+      }
+
+      function createRow(){
+        const tr = document.createElement('tr');
+
+        const tdPos = document.createElement('td');
+        tdPos.className='muted';
+        tdPos.style.textAlign='right';
+        tdPos.textContent = String($tbody.children.length + 1);
+
+        const tdGrp = document.createElement('td');
+        const selGrp = document.createElement('select');
+
+        const tdMan = document.createElement('td');
+        const selMan = document.createElement('select');
+
+        const tdMat = document.createElement('td');
+        const selMat = document.createElement('select');
+
+        const tdVar = document.createElement('td');
+        const selVar = document.createElement('select');
+        selVar.name = 'pos_variante[]';
+
+        const tdQty = document.createElement('td');
+        const inpQty = document.createElement('input');
+        inpQty.type = 'text';
+        inpQty.name = 'pos_menge[]';
+        inpQty.placeholder = 'Menge';
+        inpQty.inputMode = 'decimal';
+
+        const tdDel = document.createElement('td');
+        const btnDel = document.createElement('button');
+        btnDel.type = 'button';
+        btnDel.className = 'btn btn-secondary';
+        btnDel.textContent = '–';
+        btnDel.title = 'Zeile entfernen';
+
+        [selGrp, selMan, selMat, selVar].forEach(s => {
+          s.style.width='100%';
+          s.innerHTML='';
+          option(s, '', '— bitte wählen —');
+        });
+
+        tdGrp.appendChild(selGrp);
+        tdMan.appendChild(selMan);
+        tdMat.appendChild(selMat);
+        tdVar.appendChild(selVar);
+        tdQty.appendChild(inpQty);
+        tdDel.appendChild(btnDel);
+
+        tr.appendChild(tdPos);
+        tr.appendChild(tdGrp);
+        tr.appendChild(tdMan);
+        tr.appendChild(tdMat);
+        tr.appendChild(tdVar);
+        tr.appendChild(tdQty);
+        tr.appendChild(tdDel);
+
+        // Laden: Gruppen
+        api('list_groups').then(j=>{
+          if (j && j.ok) {
+            j.data.forEach(r=>option(selGrp, r.id, r.text));
+          } else {
+            toast(j && j.error ? j.error : 'Fehler beim Laden der Gruppen');
+          }
+        }).catch(err=>toast(err));
+
+        // Events
+        selGrp.addEventListener('change', ()=>{
+          selMan.innerHTML=''; option(selMan,'','— bitte wählen —');
+          selMat.innerHTML=''; option(selMat,'','— bitte wählen —');
+          selVar.innerHTML=''; option(selVar,'','— bitte wählen —');
+
+          const gid = parseInt(selGrp.value||'0',10);
+          api('list_manu', {gid: isNaN(gid)?0:gid})
+            .then(j=>{
+              if (j && j.ok) { j.data.forEach(r=>option(selMan, r.id, r.text)); }
+              else { toast(j && j.error ? j.error : 'Fehler beim Laden der Hersteller'); }
+            })
+            .catch(err=>toast(err));
+        });
+
+        selMan.addEventListener('change', ()=>{
+          selMat.innerHTML=''; option(selMat,'','— bitte wählen —');
+          selVar.innerHTML=''; option(selVar,'','— bitte wählen —');
+          const gid = parseInt(selGrp.value||'0',10);
+          const hid = parseInt(selMan.value||'0',10);
+          api('list_mat', {gid: isNaN(gid)?0:gid, hid: isNaN(hid)?-99999:hid})
+            .then(j=>{
+              if (j && j.ok) { j.data.forEach(r=>option(selMat, r.id, r.text)); }
+              else { toast(j && j.error ? j.error : 'Fehler beim Laden der Artikel'); }
+            })
+            .catch(err=>toast(err));
+        });
+
+        selMat.addEventListener('change', ()=>{
+          selVar.innerHTML=''; option(selVar,'','— bitte wählen —');
+          const mid = parseInt(selMat.value||'0',10);
+          if (!isNaN(mid) && mid>0) {
+            api('list_var', {mid})
+              .then(j=>{
+                if (j && j.ok) { j.data.forEach(r=>option(selVar, r.id, r.text)); }
+                else { toast(j && j.error ? j.error : 'Fehler beim Laden der Varianten'); }
+              })
+              .catch(err=>toast(err));
+          }
+        });
+
+        btnDel.addEventListener('click', ()=>{
+          tr.remove();
+          Array.from($tbody.children).forEach((row, idx) => {
+            row.firstChild.textContent = String(idx+1);
+          });
+        });
+
+        $tbody.appendChild(tr);
+      }
+
+      document.getElementById('btn-add-row').addEventListener('click', createRow);
+
+      // mindestens eine Zeile initial
+      createRow();
+      createRow(); // optional zweite
+    })();
   </script>
-<?php
-layout_footer();
 
-/* ========= AJAX: offene Varianten für Mitarbeiter (Typ R) ========= */
-if (($_GET['ajax'] ?? '') === 'offen') {
-  header('Content-Type: application/json; charset=utf-8');
-  $mid = (int)($_GET['mid'] ?? 0);
-  if ($mid<=0) { echo json_encode(new stdClass()); exit; }
-  $st = $pdo->prepare("
-    SELECT avo.VarianteID, avo.Offen,
-           v.MaterialID, m.MaterialgruppeID AS gid, m.HerstellerID AS hid
-    FROM dbo.v_Mitarbeiter_AusgabeOffen avo
-    JOIN dbo.MatVarianten v ON v.VarianteID = avo.VarianteID
-    JOIN dbo.Material m ON m.MaterialID = v.MaterialID
-    WHERE avo.MitarbeiterID = :mid
-  ");
-  $st->execute([':mid'=>$mid]);
-  $map = [];
-  while ($r = $st->fetch(PDO::FETCH_ASSOC)) {
-    $map[(int)$r['VarianteID']] = [
-      'offen'=>(float)$r['Offen'],
-      'mid'=>(int)$r['MaterialID'],
-      'gid'=>(int)$r['gid'],
-      'hid'=>(int)$r['hid'],
-    ];
-  }
-  echo json_encode($map, JSON_UNESCAPED_UNICODE);
-  exit;
-}
+<?php layout_footer();

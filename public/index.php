@@ -26,7 +26,11 @@ $allowed = [
   'wareneingang'=> 'wareneingang',
   'wareneingang_korrektur'=> 'wareneingang_korrektur',  
   'ausgabe'     => 'ausgabe',
+  'ausgabe_bestellung_neu'=> 'ausgabe_bestellung_neu',
+  'ausgabe_lieferung'=> 'ausgabe_lieferung',
   'reporting'   => 'reporting',
+  'reporting_mitarbeiter'=> 'reporting_mitarbeiter',
+  'reporting_belege'=> 'reporting_belege',
   'variant_create'=>'variant_create',
   'dashboard'   => 'home',   // Alias
   'start'       => 'home',   // Alias
@@ -53,6 +57,8 @@ $titles = [
   'ausgabe'     => 'Ausgabe an Mitarbeiter',
   'reporting'   => 'Reporting',
   'variant_create' => 'Variante anlegen',
+  'reporting_belege'=> 'Reporting Materialbelege',
+  'reporting_mitarbeiter'=> 'Reporting Mitarbeiter',
 ];
 $title = $titles[$pageKey] ?? 'HSN Kleiderkammer';
 
